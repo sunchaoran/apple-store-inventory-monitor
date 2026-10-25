@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, Copy, FileCode2, Globe, LoaderCircle, PlugZap, RefreshCw } from "lucide-react";
+import { Check, Copy, FileCode2, LoaderCircle, PlugZap, RefreshCw } from "lucide-react";
 import { Combobox } from "@/components/Combobox";
-import { CollapsiblePanel } from "@/components/CollapsiblePanel";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -87,7 +86,7 @@ function GuideStep({ index, title, children }: { index: number; title: string; c
 }
 
 function FieldHint({ children }: { children: React.ReactNode }) {
-  return <p className="text-[10px] leading-4 break-words text-muted-foreground">{children}</p>;
+  return <p className="text-[11px] leading-4 break-words text-muted-foreground">{children}</p>;
 }
 
 /** 醒目的界面名称，例如菜单、按钮。 */
@@ -107,7 +106,7 @@ function ClashSetupGuide({ clash }: { clash: ClashSettings }) {
   return (
     <Dialog>
       <DialogTrigger asChild>
-        <Button type="button" variant="ghost" className="h-9 rounded-xl text-muted-foreground">
+        <Button type="button" variant="outline" size="sm" className="shrink-0">
           <FileCode2 aria-hidden="true" /> 配置教程
         </Button>
       </DialogTrigger>
@@ -288,7 +287,7 @@ function NodePicker({
     <div className="field-group">
       <div className="flex items-center justify-between gap-2">
         <Label className="control-label">{pinned !== null ? "指定节点" : "当前节点"}</Label>
-        <span className="text-[10px] text-muted-foreground">
+        <span className="text-xs text-muted-foreground tabular-nums">
           {loading ? "测速中…" : list ? `${reachable}/${list.nodes.length} 个可用` : ""}
         </span>
       </div>
@@ -316,7 +315,6 @@ function NodePicker({
           type="button"
           variant="outline"
           size="icon"
-          className="size-10 rounded-xl border-border/70 bg-background/30"
           aria-label="重新测速"
           title="重新测速"
           disabled={loading}
@@ -325,7 +323,7 @@ function NodePicker({
           <RefreshCw className={loading ? "animate-spin" : ""} aria-hidden="true" />
         </Button>
       </div>
-      <p className="text-[11px] leading-4 break-words text-muted-foreground">
+      <p className={error ? "text-xs leading-5 break-words text-destructive" : "hint"}>
         {error ??
           (pinned !== null
             ? "固定使用该节点，被 Apple 拒绝时不会自动切换，下一轮继续用它重试。"
@@ -338,10 +336,10 @@ function NodePicker({
 function CheckResult({ check, port }: { check: ClashRouteCheck | string | null; port: number }) {
   if (check === null) return null;
   if (typeof check === "string") {
-    return <p role="alert" className="text-[11px] leading-4 break-words text-destructive">{check}</p>;
+    return <p role="alert" className="text-xs leading-5 break-words text-destructive">{check}</p>;
   }
   return (
-    <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-lg border border-border/55 bg-background/30 px-3 py-2 text-[11px] leading-4">
+    <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-lg bg-muted px-3 py-2 text-xs leading-5">
       <dt className="text-muted-foreground">内核</dt>
       <dd className="truncate">{check.version}</dd>
       <dt className="text-muted-foreground">可用节点</dt>
@@ -349,7 +347,7 @@ function CheckResult({ check, port }: { check: ClashRouteCheck | string | null; 
         {check.nodes.length} 个{check.skipped > 0 ? `（已排除 ${check.skipped} 个信息节点）` : ""}
       </dd>
       <dt className="text-muted-foreground">测速超时</dt>
-      <dd className={check.timeoutCount > 0 ? "text-unknown" : ""}>
+      <dd className={check.timeoutCount > 0 ? "text-unknown-text" : ""}>
         {check.timeoutCount} 个{check.timeoutCount > 0 ? "，切换前会逐个复测并跳过" : ""}
       </dd>
       <dt className="text-muted-foreground">当前节点</dt>
@@ -389,13 +387,11 @@ export function NetworkSettings({
   });
 
   return (
-    <CollapsiblePanel
-      id="network"
-      icon={<Globe className="size-4" />}
-      title="查询线路"
-      subtitle={route ? `当前：${route}` : "Apple 查询使用的出口 IP"}
-      summary={route ?? MODE_LABELS[network.mode]}
-    >
+    <>
+      <div className="grid gap-0.5">
+        <h3 id="network-title" className="section-heading">查询线路</h3>
+        <p className="hint">{route ? `当前：${route}` : "向 Apple 查询库存时使用的出口 IP，不影响电脑本身的网络。"}</p>
+      </div>
       <div className="field-group">
         <Label htmlFor="network-mode" className="control-label">出口方式</Label>
         <Select
@@ -414,16 +410,16 @@ export function NetworkSettings({
             ))}
           </SelectContent>
         </Select>
-        <p className="text-[11px] leading-4 break-words text-muted-foreground">
+        <p className="hint">
           {MODE_HINTS[network.mode]}
           {running ? " 修改后会在下一次查询时重启查询浏览器。" : ""}
         </p>
       </div>
 
       {network.mode !== "system" ? (
-        <div className="mt-3 grid min-w-0 gap-3">
-          <div className="flex items-center justify-between gap-3 rounded-lg border border-primary/30 bg-primary/5 px-3 py-2">
-            <p className="text-[11px] leading-4 text-muted-foreground">
+        <div className="grid min-w-0 gap-3">
+          <div className="flex items-center justify-between gap-3 rounded-lg bg-primary/8 px-3 py-2.5">
+            <p className="text-xs leading-5 text-foreground/80">
               首次使用需要先在 Clash 中开启外部控制器并添加扩展脚本，按教程约 3 分钟完成。
             </p>
             <ClashSetupGuide clash={draft} />
@@ -495,25 +491,23 @@ export function NetworkSettings({
             </div>
           </div>
 
-          <div className="grid gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              className="h-9 rounded-xl border-border/70 bg-background/30"
-              disabled={checking}
-              onClick={async () => {
-                setChecking(true);
-                setCheck(await testClashRoute(draft));
-                setChecking(false);
-              }}
-            >
-              {checking ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <PlugZap aria-hidden="true" />}
-              检查线路
-            </Button>
-          </div>
+          <Button
+            type="button"
+            variant="outline"
+            className="w-full"
+            disabled={checking}
+            onClick={async () => {
+              setChecking(true);
+              setCheck(await testClashRoute(draft));
+              setChecking(false);
+            }}
+          >
+            {checking ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <PlugZap aria-hidden="true" />}
+            检查线路
+          </Button>
           <CheckResult check={check} port={draft.proxyPort} />
         </div>
       ) : null}
-    </CollapsiblePanel>
+    </>
   );
 }

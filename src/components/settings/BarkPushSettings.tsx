@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { BellRing } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -41,11 +40,7 @@ export function BarkPushSettings({ options }: { options: BarkOptions }) {
     void saveSettings({ barkOptions: { ...options, ...patch } });
 
   return (
-    <div className="mt-3 space-y-3 rounded-xl border border-border/55 bg-background/30 p-3">
-      <p className="flex items-center gap-2 text-xs font-medium text-muted-foreground">
-        <BellRing className="size-3.5" aria-hidden="true" /> Bark 推送增强
-      </p>
-
+    <div className="grid gap-3">
       <div className="field-group">
         <Label htmlFor="bark-level" className="control-label">通知等级</Label>
         <Select value={options.level} onValueChange={(value) => save({ level: value as BarkLevel })}>
@@ -58,7 +53,7 @@ export function BarkPushSettings({ options }: { options: BarkOptions }) {
             ))}
           </SelectContent>
         </Select>
-        <p className="text-[11px] leading-4 break-words text-muted-foreground">
+        <p className="hint">
           「重要警告」需要先在 iPhone 设置与 Bark App 里开启对应权限；开启后会忽略静音和勿扰模式。
         </p>
       </div>
@@ -86,7 +81,7 @@ export function BarkPushSettings({ options }: { options: BarkOptions }) {
               ))}
             </SelectContent>
           </Select>
-          <p className="text-[11px] leading-4 break-words text-muted-foreground">
+          <p className="hint">
             可在 Bark App 的「铃声」页试听。
           </p>
         </div>
@@ -109,24 +104,26 @@ export function BarkPushSettings({ options }: { options: BarkOptions }) {
               else setVolume(String(parsed));
             }}
           />
-          <p className="text-[11px] leading-4 break-words text-muted-foreground">
+          <p className="hint">
             0–10，仅「重要警告」生效。
           </p>
         </div>
       </div>
 
-      <div className="setting-row">
-        <Label htmlFor="bark-call" className="text-sm font-normal">持续响铃</Label>
-        <Switch
-          id="bark-call"
-          aria-label="持续响铃"
-          checked={options.call}
-          onCheckedChange={(call) => save({ call })}
-        />
+      <div className="grid gap-1">
+        <div className="setting-row">
+          <Label htmlFor="bark-call" className="text-sm font-normal">持续响铃</Label>
+          <Switch
+            id="bark-call"
+            aria-label="持续响铃"
+            checked={options.call}
+            onCheckedChange={(call) => save({ call })}
+          />
+        </div>
+        <p className="hint">
+          开启后铃声重复播放约 30 秒；配合「重要警告」可在静音、勿扰模式下持续响铃。
+        </p>
       </div>
-      <p className="text-[11px] leading-4 break-words text-muted-foreground">
-        开启后铃声重复播放约 30 秒；配合「重要警告」可在静音、勿扰模式下持续响铃。
-      </p>
     </div>
   );
 }

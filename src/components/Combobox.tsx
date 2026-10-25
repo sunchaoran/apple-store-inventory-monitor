@@ -35,6 +35,7 @@ export function Combobox({
   emptyText,
   disabled,
   className,
+  modal,
 }: {
   options: ComboboxOption[];
   value: string;
@@ -44,12 +45,14 @@ export function Combobox({
   emptyText: string;
   disabled?: boolean;
   className?: string;
+  /** 放在对话框里时要设为 true，否则对话框的滚动锁会让下拉列表无法滚动。 */
+  modal?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const selected = options.find((o) => o.value === value);
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={setOpen} modal={modal}>
       <PopoverTrigger asChild>
         <Button
           variant="outline"

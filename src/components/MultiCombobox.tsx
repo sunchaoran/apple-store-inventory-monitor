@@ -20,6 +20,7 @@ export function MultiCombobox({
   selectionUnit,
   disabled,
   className,
+  modal,
 }: {
   options: ComboboxOption[];
   values: string[];
@@ -30,6 +31,8 @@ export function MultiCombobox({
   selectionUnit: string;
   disabled?: boolean;
   className?: string;
+  /** 放在对话框里时要设为 true，否则对话框的滚动锁会让选项列表无法滚动。 */
+  modal?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -80,7 +83,7 @@ export function MultiCombobox({
   }
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={setOpen} modal={modal}>
       <PopoverTrigger asChild>
         <Button
           variant="outline"

@@ -3,80 +3,83 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * 配色原则：界面底色是带一点暖意的中性灰，只保留一种强调色（沉稳的蓝）。
+ * 状态色按「要不要你做点什么」分层，而不是一个状态一种鲜艳颜色：
+ *   - 有货是唯一需要立刻行动的状态，用实心绿色；
+ *   - 无货是常态，用安静的中性灰，满屏无货也不刺眼；
+ *   - 结果不可信（拦截、限流、冷却、查询失败）用琥珀色提醒，别把它当成无货；
+ *   - 其余说明性状态（即将发售、暂未开售、不支持取货、暂不可购买）用低饱和的
+ *     蓝、紫、石板、赭石区分，配合文字标签，不靠颜色单独表达。
+ * 状态标签的文字统一用前景色，颜色只落在圆点和浅色底上，保证对比度。
+ */
 :root {
-  --radius: 0.75rem;
-  --background: oklch(0.97 0.008 265);
-  --foreground: oklch(0.19 0.022 269);
-  --card: oklch(0.995 0.003 265);
-  --card-foreground: oklch(0.19 0.022 269);
+  --radius: 0.625rem;
+  --background: oklch(0.975 0.002 90);
+  --foreground: oklch(0.22 0.006 85);
+  --card: oklch(0.995 0.0015 90);
+  --card-foreground: oklch(0.22 0.006 85);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.19 0.022 269);
-  --primary: oklch(0.58 0.19 265);
+  --popover-foreground: oklch(0.22 0.006 85);
+  --primary: oklch(0.53 0.13 255);
   --primary-foreground: oklch(0.99 0 0);
-  --secondary: oklch(0.925 0.018 265);
-  --secondary-foreground: oklch(0.25 0.028 269);
-  --muted: oklch(0.94 0.012 265);
-  --muted-foreground: oklch(0.48 0.024 269);
-  --accent: oklch(0.92 0.026 265);
-  --accent-foreground: oklch(0.25 0.04 265);
-  --destructive: oklch(0.58 0.225 27);
-  --border: oklch(0.87 0.018 265);
-  --input: oklch(0.88 0.018 265);
-  --ring: oklch(0.58 0.19 265);
-  --in-stock: oklch(0.59 0.17 150);
-  --unknown: oklch(0.62 0.2 35);
-  --out-of-stock: #a61b51;
-  --presale: #1d4ed8;
-  --coming-soon: #6d28d9;
-  --pickup-unsupported: #475569;
-  --not-for-sale: #786000;
-  --delivery-fast: oklch(0.5 0.145 154);
-  --delivery-soon: oklch(0.48 0.135 220);
-  --delivery-standard: oklch(0.5 0.17 265);
-  --delivery-later: oklch(0.49 0.125 70);
-  --delivery-unknown: oklch(0.46 0.035 260);
-  --panel-highlight: oklch(1 0 0 / 78%);
-  --panel-shadow: oklch(0.2 0.04 270 / 10%);
-  --canvas-glow: oklch(0.65 0.19 265 / 12%);
+  --secondary: oklch(0.945 0.003 90);
+  --secondary-foreground: oklch(0.28 0.006 85);
+  --muted: oklch(0.955 0.0025 90);
+  --muted-foreground: oklch(0.5 0.008 85);
+  --accent: oklch(0.94 0.004 90);
+  --accent-foreground: oklch(0.22 0.006 85);
+  --destructive: oklch(0.55 0.18 27);
+  --border: oklch(0.905 0.004 90);
+  --input: oklch(0.875 0.005 90);
+  --ring: oklch(0.53 0.13 255);
+
+  --in-stock: oklch(0.52 0.13 152);
+  --in-stock-foreground: oklch(0.99 0 0);
+  --out-of-stock: oklch(0.62 0.008 85);
+  --pickup-unsupported: oklch(0.52 0.03 250);
+  --not-for-sale: oklch(0.58 0.1 78);
+  --presale: oklch(0.55 0.12 245);
+  --coming-soon: oklch(0.52 0.13 295);
+  --unknown: oklch(0.66 0.15 58);
+  --unknown-text: oklch(0.5 0.12 50);
 }
 
 .dark {
-  --background: oklch(0.115 0.014 272);
-  --foreground: oklch(0.94 0.008 265);
-  --card: oklch(0.165 0.018 272);
-  --card-foreground: oklch(0.94 0.008 265);
-  --popover: oklch(0.205 0.02 272);
-  --popover-foreground: oklch(0.95 0.006 265);
-  --primary: oklch(0.7 0.17 264);
-  --primary-foreground: oklch(0.13 0.022 272);
-  --secondary: oklch(0.225 0.021 272);
-  --secondary-foreground: oklch(0.92 0.008 265);
-  --muted: oklch(0.215 0.017 272);
-  --muted-foreground: oklch(0.69 0.02 265);
-  --accent: oklch(0.25 0.035 267);
-  --accent-foreground: oklch(0.95 0.006 265);
-  --destructive: oklch(0.68 0.19 25);
-  --border: oklch(0.31 0.021 272 / 72%);
-  --input: oklch(0.32 0.022 272 / 82%);
-  --ring: oklch(0.7 0.17 264);
-  --in-stock: oklch(0.76 0.18 150);
-  --unknown: oklch(0.74 0.16 50);
-  --out-of-stock: #fb8fb1;
-  --presale: #83b8ff;
-  --coming-soon: #c4a1ff;
-  --pickup-unsupported: #b0bac9;
-  --not-for-sale: #e6cc70;
-  --delivery-fast: oklch(0.77 0.16 154);
-  --delivery-soon: oklch(0.78 0.13 220);
-  --delivery-standard: oklch(0.76 0.15 265);
-  --delivery-later: oklch(0.8 0.13 80);
-  --delivery-unknown: oklch(0.74 0.035 260);
-  --panel-highlight: oklch(0.205 0.02 272 / 92%);
-  --panel-shadow: oklch(0.03 0.02 272 / 40%);
-  --canvas-glow: oklch(0.5 0.17 270 / 13%);
+  --background: oklch(0.165 0.003 85);
+  --foreground: oklch(0.93 0.004 85);
+  --card: oklch(0.2 0.003 85);
+  --card-foreground: oklch(0.93 0.004 85);
+  --popover: oklch(0.225 0.004 85);
+  --popover-foreground: oklch(0.93 0.004 85);
+  --primary: oklch(0.7 0.12 252);
+  --primary-foreground: oklch(0.17 0.01 255);
+  --secondary: oklch(0.26 0.004 85);
+  --secondary-foreground: oklch(0.92 0.004 85);
+  --muted: oklch(0.24 0.004 85);
+  --muted-foreground: oklch(0.68 0.008 85);
+  --accent: oklch(0.27 0.005 85);
+  --accent-foreground: oklch(0.94 0.004 85);
+  --destructive: oklch(0.7 0.16 25);
+  --border: oklch(0.29 0.004 85);
+  --input: oklch(0.34 0.005 85);
+  --ring: oklch(0.7 0.12 252);
+
+  --in-stock: oklch(0.74 0.15 152);
+  --in-stock-foreground: oklch(0.17 0.01 152);
+  --out-of-stock: oklch(0.56 0.008 85);
+  --pickup-unsupported: oklch(0.72 0.03 250);
+  --not-for-sale: oklch(0.78 0.1 82);
+  --presale: oklch(0.74 0.11 245);
+  --coming-soon: oklch(0.74 0.11 295);
+  --unknown: oklch(0.78 0.14 65);
+  --unknown-text: oklch(0.8 0.13 65);
 }
 
 @theme inline {
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -100,17 +103,14 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-in-stock: var(--in-stock);
-  --color-unknown: var(--unknown);
+  --color-in-stock-foreground: var(--in-stock-foreground);
   --color-out-of-stock: var(--out-of-stock);
-  --color-presale: var(--presale);
-  --color-coming-soon: var(--coming-soon);
   --color-pickup-unsupported: var(--pickup-unsupported);
   --color-not-for-sale: var(--not-for-sale);
-  --color-delivery-fast: var(--delivery-fast);
-  --color-delivery-soon: var(--delivery-soon);
-  --color-delivery-standard: var(--delivery-standard);
-  --color-delivery-later: var(--delivery-later);
-  --color-delivery-unknown: var(--delivery-unknown);
+  --color-presale: var(--presale);
+  --color-coming-soon: var(--coming-soon);
+  --color-unknown: var(--unknown);
+  --color-unknown-text: var(--unknown-text);
 }
 
 @layer base {
@@ -127,10 +127,13 @@
   }
 
   body {
-    @apply bg-background text-foreground antialiased;
+    @apply bg-background font-sans text-foreground antialiased;
     overflow-x: hidden;
     user-select: none;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", Inter, system-ui, sans-serif;
+  }
+
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 22%, transparent);
   }
 
   button,
@@ -145,61 +148,37 @@
 }
 
 @layer components {
-  .app-canvas {
-    background:
-      radial-gradient(circle at 12% -18%, var(--canvas-glow), transparent 34rem),
-      radial-gradient(circle at 92% 112%, color-mix(in oklch, var(--in-stock) 7%, transparent), transparent 30rem),
-      var(--background);
+  /* 主界面的卡片：平面、细边框，不用渐变和大阴影抢内容的注意力。 */
+  .panel {
+    @apply rounded-xl border border-border bg-card text-card-foreground;
+    box-shadow: 0 1px 2px oklch(0 0 0 / 4%);
   }
 
-  .surface-panel {
-    border: 1px solid var(--border);
-    border-radius: 1rem;
-    background: linear-gradient(145deg, var(--panel-highlight), var(--card));
-    box-shadow: 0 18px 45px -30px var(--panel-shadow), inset 0 1px 0 color-mix(in oklch, var(--foreground) 5%, transparent);
-  }
-
-  .workspace-sidebar {
-    scrollbar-gutter: stable;
+  /* 长时间挂着的窗口里，滚动条要存在但不碍眼。 */
+  .scroll-quiet {
     scrollbar-width: thin;
-    scrollbar-color: color-mix(in oklch, var(--muted-foreground) 42%, transparent) transparent;
+    scrollbar-color: color-mix(in oklch, var(--muted-foreground) 35%, transparent) transparent;
   }
 
-  .workspace-sidebar::-webkit-scrollbar {
+  .scroll-quiet::-webkit-scrollbar {
     width: 10px;
+    height: 10px;
   }
 
-  .workspace-sidebar::-webkit-scrollbar-track {
+  .scroll-quiet::-webkit-scrollbar-track {
     background: transparent;
   }
 
-  .workspace-sidebar::-webkit-scrollbar-thumb {
+  .scroll-quiet::-webkit-scrollbar-thumb {
     border: 3px solid transparent;
     border-radius: 999px;
-    background: color-mix(in oklch, var(--muted-foreground) 42%, transparent);
+    background: color-mix(in oklch, var(--muted-foreground) 35%, transparent);
     background-clip: padding-box;
   }
 
-  .workspace-sidebar::-webkit-scrollbar-thumb:hover {
-    background: color-mix(in oklch, var(--muted-foreground) 64%, transparent);
+  .scroll-quiet::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in oklch, var(--muted-foreground) 55%, transparent);
     background-clip: padding-box;
-  }
-
-  .brand-mark {
-    @apply flex size-10 shrink-0 items-center justify-center rounded-xl border border-primary/20 bg-primary/10 text-primary;
-    box-shadow: inset 0 1px 0 color-mix(in oklch, var(--foreground) 8%, transparent), 0 10px 24px -16px var(--primary);
-  }
-
-  .status-pill {
-    @apply flex h-10 items-center gap-2 rounded-xl border border-border/65 bg-background/35 px-3;
-  }
-
-  .eyebrow {
-    @apply flex items-center gap-1.5 text-[11px] font-semibold tracking-[0.12em] text-primary uppercase;
-  }
-
-  .section-icon {
-    @apply flex size-8 shrink-0 items-center justify-center rounded-lg border border-border/60 bg-muted/45 text-muted-foreground;
   }
 
   .field-group {
@@ -207,29 +186,33 @@
   }
 
   .control-label {
-    @apply flex h-5 items-center gap-1.5 text-xs font-medium text-muted-foreground;
+    @apply flex min-h-5 items-center gap-1.5 text-xs font-medium text-muted-foreground;
   }
 
   .control-surface {
-    @apply h-10 rounded-xl border-border/70 bg-background/40 px-3 shadow-none transition-colors hover:border-primary/35 hover:bg-background/60 focus-visible:border-primary/60;
+    @apply h-9 rounded-lg border-input bg-card px-3 shadow-none transition-colors hover:border-foreground/25 focus-visible:border-primary/60;
   }
 
-  .metric-tile {
-    @apply grid min-w-0 grid-cols-[auto_1fr] items-center gap-x-2 rounded-2xl border border-border/70 bg-card px-3.5 py-3 shadow-sm;
-  }
-
-  .metric-value {
-    @apply text-right text-xl font-semibold tracking-tight tabular-nums;
-  }
-
-  .metric-label {
-    @apply col-span-2 mt-1 text-[11px] text-muted-foreground;
+  /* 设置项里的说明文字：比正文小一号，但不小到需要眯眼。 */
+  .hint {
+    @apply text-xs leading-5 break-words text-muted-foreground;
   }
 
   .setting-row {
-    @apply flex min-h-10 items-center justify-between rounded-lg px-2.5 transition-colors hover:bg-muted/45;
+    @apply flex min-h-9 items-center justify-between gap-3;
   }
 
+  .settings-section {
+    @apply grid min-w-0 gap-3;
+  }
+
+  .settings-section + .settings-section {
+    @apply border-t border-border pt-4;
+  }
+
+  .section-heading {
+    @apply flex items-center gap-2 text-[13px] font-semibold text-foreground;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
