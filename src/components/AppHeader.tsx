@@ -2,6 +2,7 @@ import packageInfo from "../../package.json";
 import { Pause, Play, RefreshCw, ShoppingCart } from "lucide-react";
 
 import { BrandMark, GithubBrandIcon, XBrandIcon } from "@/components/BrandIcons";
+import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { describeRun, type RunStatus, type RunTone } from "@/lib/runStatus";
@@ -162,7 +163,8 @@ export function AppHeader({
           </Tooltip>
         )}
 
-        <div className="ml-1 flex items-center" aria-label="项目链接">
+        <div className="ml-1 flex items-center">
+          <ThemeSwitcher />
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
