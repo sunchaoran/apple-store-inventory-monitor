@@ -1,7 +1,7 @@
 import packageInfo from "../../package.json";
-import { Pause, Play, Radar, RefreshCw, ShoppingCart } from "lucide-react";
+import { Pause, Play, RefreshCw, ShoppingCart } from "lucide-react";
 
-import { GithubBrandIcon, XBrandIcon } from "@/components/BrandIcons";
+import { BrandMark, GithubBrandIcon, XBrandIcon } from "@/components/BrandIcons";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { UiState } from "@/lib/store";
@@ -54,9 +54,7 @@ export function AppHeader({
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-card px-4">
       <div className="flex shrink-0 items-center gap-2.5">
-        <div className="flex size-8 items-center justify-center rounded-lg bg-primary/10 text-primary" aria-hidden="true">
-          <Radar className="size-[18px]" strokeWidth={2} />
-        </div>
+        <BrandMark className="size-7" />
         <h1 className="text-[15px] font-semibold tracking-tight">拾果</h1>
         <span className="text-xs text-muted-foreground tabular-nums max-[1000px]:hidden">v{packageInfo.version}</span>
       </div>

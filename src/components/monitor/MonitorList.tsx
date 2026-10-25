@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { AlertTriangle, ListFilter, LoaderCircle, Plus, Radar, Trash2 } from "lucide-react";
+import { AlertTriangle, ListFilter, LoaderCircle, Plus, Trash2 } from "lucide-react";
 
+import { BrandMark } from "@/components/BrandIcons";
 import { AddMonitorDialog } from "@/components/monitor/AddMonitorDialog";
 import { ProductBarkRoute } from "@/components/monitor/ProductBarkRoute";
 import { DeliverySummary, StatusChip } from "@/components/monitor/StatusChip";
@@ -71,9 +72,13 @@ function FilterBar({
 function EmptyState({ ready, onAdd }: { ready: boolean; onAdd: () => void }) {
   return (
     <div className="flex h-full min-h-64 flex-col items-center justify-center px-6 py-10 text-center">
-      <div className="mb-4 flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
-        {ready ? <Radar className="size-6" aria-hidden="true" /> : <LoaderCircle className="size-6 animate-spin" aria-hidden="true" />}
-      </div>
+      {ready ? (
+        <BrandMark className="mb-4 size-12" />
+      ) : (
+        <div className="mb-4 flex size-12 items-center justify-center rounded-2xl bg-muted text-muted-foreground">
+          <LoaderCircle className="size-6 animate-spin" aria-hidden="true" />
+        </div>
+      )}
       <p className="text-sm font-semibold">{ready ? "还没有监控项目" : "正在载入目录…"}</p>
       <p className="mt-1 max-w-xs text-xs leading-5 text-muted-foreground">
         {ready

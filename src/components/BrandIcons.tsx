@@ -1,3 +1,34 @@
+import { useId } from "react";
+
+/**
+ * 拾果的标志：只取应用图标里的果子、叶子和对勾，不带底板，深浅主题下都清楚。
+ * 图形与 assets/icon.svg 一致，改图标时两处要一起改。
+ */
+export function BrandMark({ className }: { className?: string }) {
+  // useId 可能带冒号等字符，放进 SVG 的 url(#…) 引用前只保留安全字符。
+  const id = `brand${useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const fruit = `${id}-fruit`;
+  const leaf = `${id}-leaf`;
+  return (
+    <svg viewBox="222 206 580 596" className={className} aria-hidden="true">
+      <defs>
+        <linearGradient id={fruit} x1="0.2" y1="0.1" x2="0.85" y2="0.95">
+          <stop offset="0" stopColor="#FF7B5E" />
+          <stop offset="1" stopColor="#E2453B" />
+        </linearGradient>
+        <linearGradient id={leaf} x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0" stopColor="#5CCB8A" />
+          <stop offset="1" stopColor="#2E9D63" />
+        </linearGradient>
+      </defs>
+      <path d="M506 334 Q500 292 470 262" fill="none" stroke="#7A5134" strokeWidth="24" strokeLinecap="round" />
+      <circle cx="512" cy="560" r="232" fill={`url(#${fruit})`} />
+      <path d="M522 322 C552 252 618 214 684 214 C672 284 616 330 522 322 Z" fill={`url(#${leaf})`} />
+      <path d="M404 566 L486 646 L628 500" fill="none" stroke="#fff" strokeWidth="64" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 export function GithubBrandIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
