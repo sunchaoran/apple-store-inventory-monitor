@@ -18,7 +18,7 @@
 ## 一图看懂
 
 <p>
-  <img width="24%" alt="果到雷达：盯货、换线、下单，全程自动" src="docs/promo/poster-1.png" />
+  <img width="24%" alt="拾果：盯货、换线、下单，全程自动" src="docs/promo/poster-1.png" />
   <img width="24%" alt="三步设好，到货秒知道：选门店和型号、开始监控、等提醒" src="docs/promo/poster-2.png" />
   <img width="24%" alt="被 Apple 拦截时自动换 Clash 节点接着查" src="docs/promo/poster-3.png" />
   <img width="24%" alt="到货立即下单：打开开关后核对通过自动点立即下单，付款由你完成" src="docs/promo/poster-4.png" />
