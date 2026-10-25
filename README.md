@@ -1,13 +1,13 @@
 # 拾果
 
 [![CI](https://github.com/suversal/apple-store-inventory-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/suversal/apple-store-inventory-monitor/actions/workflows/ci.yml)
-[![源码版本: v1.0.24](https://img.shields.io/badge/source-v1.0.24-blue)](package.json)
+[![源码版本: v1.0.25](https://img.shields.io/badge/source-v1.0.25-blue)](package.json)
 [下载与发布记录](https://github.com/suversal/apple-store-inventory-monitor/releases)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
 
 拾果是一款 Apple 直营店取货库存监控工具。选好地区、门店和具体型号后，它会定时检查库存；检测到有货时，可以播放提示音、推送 Bark，并按你的选择打开 Apple 购物袋或商品详情。中国大陆直营店取货还可以开启[自动结账](#自动结账可选)：到货后由应用自己的浏览器走完结账页面，停在「查看订单」页等你确认。
 
-支持 macOS、Windows 和 Linux，使用 Rust、Tauri 2 和 React 编写。拾果的正式版本从 **1.0.0** 开始，本 README 对应 `1.0.24` 源码。应用名称为 **拾果**（英文名 Shiguo；`1.0.24` 及更早的版本名为「果到雷达」），仓库名为 `apple-store-inventory-monitor`。
+支持 macOS、Windows 和 Linux，使用 Rust、Tauri 2 和 React 编写。拾果的正式版本从 **1.0.0** 开始，本 README 对应 `1.0.25` 源码。应用名称为 **拾果**（英文名 Shiguo；`1.0.25` 及更早的版本名为「果到雷达」），仓库名为 `apple-store-inventory-monitor`。
 
 基于 [ENCHIGO/apple-pickup-watcher v0.3.2](https://github.com/ENCHIGO/apple-pickup-watcher/tree/v0.3.2) 继续开发，按 GPL-3.0-or-later 发布。来源与修改记录见 [NOTICE](NOTICE)。
 
@@ -84,7 +84,7 @@ Apple 可能限流或调整接口，库存也可能在提醒后立即变化。�
 1. 打开 `.dmg`，把 `拾果.app` 拖进「应用程序」，不要直接在磁盘映像中长期运行。
 2. 应用包已经过完整的 ad-hoc 签名，但暂未使用 Developer ID 证书，也未经过 Apple 公证。如果系统提示无法验证开发者，可以在 Finder 中按住 Control 点击应用并选择「打开」，或到「系统设置 → 隐私与安全性」确认被拦截的是本应用，再选择「仍要打开」。
 
-`v1.0.2` 的 macOS 包曾因应用签名不完整而被系统误报为“已损坏”，此问题已在 `v1.0.3` 修复。如果新版仍显示旧提示，请先删除旧应用和旧 DMG，确认重新下载的文件名包含 `1.0.24`。确认安装包来自本仓库 Release 后，仍可执行：
+`v1.0.2` 的 macOS 包曾因应用签名不完整而被系统误报为“已损坏”，此问题已在 `v1.0.3` 修复。如果新版仍显示旧提示，请先删除旧应用和旧 DMG，确认重新下载的文件名包含 `1.0.25`。确认安装包来自本仓库 Release 后，仍可执行：
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/拾果.app"
@@ -107,7 +107,7 @@ Release 提供 x64 的 `.deb` 和 `.AppImage`。安装包在 Ubuntu 24.04 上构
 **Debian / Ubuntu：**
 
 ```bash
-sudo apt install "./apple-store-inventory-monitor_1.0.24_amd64.deb"
+sudo apt install "./apple-store-inventory-monitor_1.0.25_amd64.deb"
 ```
 
 `apt` 会同时安装包声明的依赖。音频播放和托盘还需要 ALSA 与 AppIndicator 运行库。
@@ -115,14 +115,14 @@ sudo apt install "./apple-store-inventory-monitor_1.0.24_amd64.deb"
 **AppImage：**
 
 ```bash
-chmod +x "./apple-store-inventory-monitor_1.0.24_amd64.AppImage"
-"./apple-store-inventory-monitor_1.0.24_amd64.AppImage"
+chmod +x "./apple-store-inventory-monitor_1.0.25_amd64.AppImage"
+"./apple-store-inventory-monitor_1.0.25_amd64.AppImage"
 ```
 
 AppImage 需要 FUSE 2。Ubuntu 24.04 可以用 `sudo apt install libfuse2t64` 安装；也可以不安装 FUSE，直接解包运行：
 
 ```bash
-"./apple-store-inventory-monitor_1.0.24_amd64.AppImage" --appimage-extract-and-run
+"./apple-store-inventory-monitor_1.0.25_amd64.AppImage" --appimage-extract-and-run
 ```
 
 Linux 还需要自行安装 Chrome、Edge 或 Chromium。使用 Chromium 时，请确认终端可以运行 `chromium` 或 `chromium-browser`。
@@ -287,7 +287,7 @@ Apple 返回 `403`、`541` 或 `429` 时，处理方式取决于「查询线路�
 - 只支持**中国大陆**的**直营店取货**，不支持送货，也不支持其他地区。
 - 一次只买**一件**商品，数量为 1。购物袋里必须只有这一件。
 - 应用**不会替你付款**。无论是否自动点「立即下单」，支付宝、微信或分期的付款都需要你自己在下单浏览器里完成。
-- 需要你事先在专属下单浏览器里登录 Apple 账户。自动加购支持有独立商品页、无需额外组合配置的型号；不支持另选表带等组合配置。会选择不折抵换购、不加 AppleCare，跳过推荐配件。关闭自动加购时仍需事先放好指定商品。
+- 需要你事先在专属下单浏览器里登录 Apple 账户。自动加购支持有独立商品页、无需额外组合配置的型号；不支持另选表带等组合配置。会选择不折抵换购，跳过推荐配件；AppleCare+ 按「加购时同时加 AppleCare+」选择，默认不加。关闭自动加购时仍需事先放好指定商品。
 - 结账流程依赖 Apple 结账页面当前的结构。Apple 调整页面后可能失效，应用会记录失败步骤和原因；提交订单前失败会关闭本次下单窗口，下一次有货时重新尝试。
 - 目前只在 macOS 上实际验证过。
 
@@ -316,6 +316,7 @@ Apple 返回 `403`、`541` 或 `429` 时，处理方式取决于「查询线路�
 | 到货后自动结账 | 总开关；成功后是否自动关闭由下方选项决定 |
 | 成功后关闭自动结账 | 默认开启，兼容原来的单次行为；关闭后成功仍保持总开关开启，监控继续运行时可再次结账，可能生成多笔真实订单并切换当前结账页面 |
 | 按到货型号自动加入购物袋 | 默认关闭，兼容原来的购物袋流程。打开后任一中国大陆监控型号到货都可触发，加购后核对 SKU、名称和数量；提交前失败后清空专属购物袋并刷新确认，再关闭页面重试；清理未成功时保持开关，下次先继续清理 |
+| 加购时同时加 AppleCare+ | 默认关闭，只在开启自动加购时显示。打开后在商品页选 AppleCare+ 服务计划；加入购物袋后仍未带上时，点一次购物袋里 AppleCare+ 的「添加」，确认已加入后再结账。商品页没有 AppleCare+ 可选或购物袋里未能加上时停下，不会改成不加 |
 | 要下单的商品 | 只在关闭自动加购时显示：只监控一件商品时自动认定，多件时须选购物袋里放的那一件 |
 | 取货人证件号码后四位 | Apple 每次结账都要求填写，必须与取货时出示的证件一致 |
 | 按下面的信息填写取货联系人 | 关闭时沿用 Apple 预填的联系信息，只检查有没有缺项。打开后可填写姓氏、名字、电子邮件地址和手机号码（不带 +86），会覆盖结账页上预填的内容，留空的项沿用页面上已有的值。姓名须与取货证件一致，下单后无法更改 |
@@ -338,7 +339,7 @@ Apple 可能默认选中取货地区附近的一家有货门店。换成另一�
 #### 到货时会发生什么
 
 1. 自动加购模式下任一中国大陆监控型号确认有货，或旧模式的指定商品有货时，照常提醒并启动一次自动结账。多个型号同时有货时不会排队启动多次结账。
-2. 自动加购先确认购物袋为空，再打开本次到货型号的商品页并加购；已恰好为本次型号 1 件时直接沿用，不重复添加。核对购物袋必须只有本次型号、数量为 1。出现其他商品或数量不符时结束本轮，清空专属购物袋后等待下次到货重新加购，不会夹带商品购买。
+2. 自动加购先确认购物袋为空，再打开本次到货型号的商品页并加购；已恰好为本次型号 1 件时直接沿用，不重复添加。核对购物袋必须只有本次型号、数量为 1，AppleCare+ 与设置一致。出现其他商品或数量不符时结束本轮，清空专属购物袋后等待下次到货重新加购，不会夹带商品购买。
 3. 选择取货门店和时段，填写取货信息，选择付款方式。
 4. 到「查看订单」页后再核对一次商品。
 5. 未打开自动下单时，在这里停下并通知你；打开时点一次「立即下单」，然后读取订单号并通知你。
@@ -697,7 +698,7 @@ macOS 应用包使用完整的 ad-hoc 签名，但没有 Developer ID 证书且�
 
 下面只比较本项目与直接上游 `ENCHIGO/apple-pickup-watcher v0.3.2` 的差异。Rust、Tauri、三态库存、四个产品品类、系统托盘和应用内更新等能力已经由上游完成，不算作本项目新增。
 
-| 项目 | 直接上游 v0.3.2 | 拾果 v1.0.24 |
+| 项目 | 直接上游 v0.3.2 | 拾果 v1.0.25 |
 | --- | --- | --- |
 | Apple 查询会话 | 普通 HTTP 客户端先访问商品页获取 Cookie，再查询库存 | 启动应用专属的持久 Chromium 会话，在 Apple 页面环境中完成校验和库存请求；同轮对被拦截地区停止重复请求，下轮按用户设置的间隔重试 |
 | 批量添加监控 | 每次选择一家门店和一个型号 | 门店、型号都可以多选，一次生成全部组合；重复组合会自动跳过 |
@@ -847,7 +848,7 @@ pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
 产物位于 `target/release/bundle/`。自动更新包需要仓库维护者配置 `TAURI_SIGNING_PRIVATE_KEY`；私钥设置了密码时还要配置 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。没有私钥时不能生成可被现有客户端验证的更新签名。
 
-正式版本由 [Release 工作流](.github/workflows/release.yml) 构建，标签使用 `v1.0.24` 这样的格式。发版前应确认 `package.json`、工作区 `Cargo.toml`、`src-tauri/tauri.conf.json` 与标签的版本一致。macOS 专用配置在 `src-tauri/tauri.macos.conf.json` 中启用 ad-hoc 签名；发布流水线会同时验证自动更新归档和 DMG 内的应用签名。
+正式版本由 [Release 工作流](.github/workflows/release.yml) 构建，标签使用 `v1.0.25` 这样的格式。发版前应确认 `package.json`、工作区 `Cargo.toml`、`src-tauri/tauri.conf.json` 与标签的版本一致。macOS 专用配置在 `src-tauri/tauri.macos.conf.json` 中启用 ad-hoc 签名；发布流水线会同时验证自动更新归档和 DMG 内的应用签名。
 
 推送 `v*` 标签后，GitHub Actions 会生成 macOS、Windows 和 Linux 安装包，并先创建草稿 Release；确认四个平台全部成功后再公开发布，避免用户下载到缺少部分平台或 `latest.json` 尚未完整生成的版本。手动运行 `workflow_dispatch` 只生成 Actions 构建产物，不会创建公开 Release。
 
@@ -903,7 +904,7 @@ src/
 ## 来源与许可
 
 本仓库直接基于 [ENCHIGO/apple-pickup-watcher](https://github.com/ENCHIGO/apple-pickup-watcher)
-`v0.3.2` 继续开发，并保留了对应 Git 历史。主要后续改动包括多门店与多型号组合监控、逐项轮次日志、重复提醒、临时 Chromium 查询会话、独立应用标识、到货后自动结账，以及「拾果」这一对外名称（`1.0.24` 及更早的版本名为「果到雷达」）。
+`v0.3.2` 继续开发，并保留了对应 Git 历史。主要后续改动包括多门店与多型号组合监控、逐项轮次日志、重复提醒、临时 Chromium 查询会话、独立应用标识、到货后自动结账，以及「拾果」这一对外名称（`1.0.25` 及更早的版本名为「果到雷达」）。
 
 `ENCHIGO/apple-pickup-watcher` 是 [hteen/apple-store-helper](https://github.com/hteen/apple-store-helper)
 的 GPL-3.0 重写版本。因此，本项目既保留直接上游 ENCHIGO 的贡献记录，也继续遵守最初项目的 GPL-3.0 派生要求。版权、承继资源和逐项修改说明见 [`NOTICE`](NOTICE)。
