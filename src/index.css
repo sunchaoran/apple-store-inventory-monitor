@@ -213,6 +213,20 @@
   .section-heading {
     @apply flex items-center gap-2 text-[13px] font-semibold text-foreground;
   }
+
+  /* 顶栏进度条在查询进行中、还不知道下一轮时间时的来回滑动。 */
+  .progress-indeterminate {
+    animation: progress-indeterminate 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -223,5 +237,12 @@
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  /* 不做动画时，不定进度改成一条静止的半透明满格，仍能看出「正在进行」。 */
+  .progress-indeterminate {
+    animation: none !important;
+    width: 100%;
+    opacity: 0.45;
   }
 }

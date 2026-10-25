@@ -49,6 +49,8 @@ export interface UiState {
   running: boolean;
   /** 调度器给出的真实下一轮时间；保护冷却会反映在这里。 */
   nextCheckAtMs: number | null;
+  /** 这一段等待的总时长，顶栏进度条按它计算已走过的比例；与 nextCheckAtMs 同时设置和清空。 */
+  countdownTotalMs: number | null;
   /** 当前目标地区中是否仍有 Apple 请求保护冷却。 */
   cooling: boolean;
   /** 最近一轮实际使用的出口线路；跟随系统代理或尚未查询时为 null。 */
@@ -131,6 +133,7 @@ let state: UiState = {
   rows: [],
   running: false,
   nextCheckAtMs: null,
+  countdownTotalMs: null,
   cooling: false,
   route: null,
   trouble: null,
@@ -207,7 +210,7 @@ function applyEvent(event: WatcherEvent): void {
       break;
 
     case "cycleStarted":
-      update({ nextCheckAtMs: null, cooling: false });
+      update({ nextCheckAtMs: null, countdownTotalMs: null, cooling: false });
       pushLog(
         `第 ${event.cycle} 轮开始查询：${event.storeCount} 家门店、${event.targetCount} 项监控。${event.cycle === 1 ? "首次使用时会先建立 Apple 查询会话，通常需要几秒。" : ""}`,
       );
@@ -219,6 +222,7 @@ function applyEvent(event: WatcherEvent): void {
       update({
         rows: event.snapshot,
         nextCheckAtMs: Date.now() + event.nextCheckInSecs * 1_000,
+        countdownTotalMs: event.nextCheckInSecs * 1_000,
         cooling: event.cooling,
         route: event.route ?? null,
         // 只有引擎明说本轮健康，才收起告警。用「所有行都没错误」去反推是
@@ -251,6 +255,7 @@ function applyEvent(event: WatcherEvent): void {
         update({
           running: event.running,
           nextCheckAtMs: event.running ? state.nextCheckAtMs : null,
+          countdownTotalMs: event.running ? state.countdownTotalMs : null,
           cooling: event.running ? state.cooling : false,
         });
         pushLog(event.running ? "已开始监控。" : "已暂停监控。");
@@ -493,7 +498,7 @@ export async function retryWatchingNow(): Promise<boolean> {
   try {
     const accepted = await invoke<boolean>("retry_watching_now");
     if (accepted) {
-      update({ nextCheckAtMs: null, cooling: false });
+      update({ nextCheckAtMs: null, countdownTotalMs: null, cooling: false });
       pushLog("已按你的选择立即重新查询。");
       return true;
     }

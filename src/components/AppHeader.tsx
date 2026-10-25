@@ -4,12 +4,10 @@ import { Pause, Play, RefreshCw, ShoppingCart } from "lucide-react";
 import { BrandMark, GithubBrandIcon, XBrandIcon } from "@/components/BrandIcons";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { describeRun, type RunStatus, type RunTone } from "@/lib/runStatus";
 import type { UiState } from "@/lib/store";
 import { openAuthorPage, openProjectPage, startWatching, stopWatching } from "@/lib/store";
-import { describeBrowserFailure } from "@/lib/monitorLog";
 import { cn } from "@/lib/utils";
-
-type RunTone = "paused" | "running" | "cooling" | "failed";
 
 const RUN_DOT: Record<RunTone, string> = {
   paused: "bg-muted-foreground/45",
@@ -18,21 +16,43 @@ const RUN_DOT: Record<RunTone, string> = {
   failed: "bg-destructive",
 };
 
-/** 运行状态一句话：只说现在在做什么、下一次什么时候查，不换行。 */
-function describeRun(ui: UiState, clockMs: number): { tone: RunTone; label: string } {
-  if (!ui.running) return { tone: "paused", label: "已暂停" };
-  const seconds = ui.nextCheckAtMs ? Math.max(0, Math.ceil((ui.nextCheckAtMs - clockMs) / 1_000)) : null;
-  if (describeBrowserFailure(ui.rows) !== null) {
-    return {
-      tone: "failed",
-      label: seconds ? `浏览器未连接 · 约 ${seconds} 秒后重试` : "浏览器未连接 · 正在重新连接",
-    };
-  }
-  if (seconds === null || seconds === 0) {
-    return { tone: "running", label: `正在查询 · 间隔 ${ui.settings.intervalSeconds} 秒` };
-  }
-  if (ui.cooling) return { tone: "cooling", label: `保护冷却中 · 约 ${seconds} 秒后检查` };
-  return { tone: "running", label: `监控中 · 约 ${seconds} 秒后检查` };
+const RUN_FILL: Record<RunTone, string> = {
+  paused: "bg-muted-foreground/40",
+  running: "bg-primary",
+  cooling: "bg-unknown",
+  failed: "bg-destructive",
+};
+
+/**
+ * 距离下一次检查的进度条。
+ *
+ * 时钟每秒才更新一次，宽度用 1 秒的线性过渡把两次更新连起来，看起来是连续走动的；
+ * 每一段等待用下一轮时间做 key 重新挂载，新一轮开始时不会从满格倒着缩回去。
+ * 还没有下一轮时间（正在查询、正在重连）时改为来回滑动的不定进度。
+ */
+function RunProgress({ status, resetKey }: { status: RunStatus; resetKey: number | null }) {
+  const percent = status.progress === null ? null : Math.round(status.progress * 1000) / 10;
+  return (
+    <div
+      role="progressbar"
+      aria-label="距离下一次检查"
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={percent ?? undefined}
+      aria-valuetext={status.countdown ?? undefined}
+      className="relative h-1.5 w-full overflow-hidden rounded-full bg-foreground/10"
+    >
+      {percent === null ? (
+        <div className={cn("progress-indeterminate absolute inset-y-0 left-0 w-2/5 rounded-full", RUN_FILL[status.tone])} />
+      ) : (
+        <div
+          key={resetKey ?? "none"}
+          className={cn("h-full rounded-full transition-[width] duration-1000 ease-linear", RUN_FILL[status.tone])}
+          style={{ width: `${percent}%` }}
+        />
+      )}
+    </div>
+  );
 }
 
 export function AppHeader({
@@ -48,7 +68,14 @@ export function AppHeader({
   onRetryNow: () => void;
   onShowCheckout: () => void;
 }) {
-  const run = describeRun(ui, clockMs);
+  const run = describeRun({
+    running: ui.running,
+    cooling: ui.cooling,
+    nextCheckAtMs: ui.nextCheckAtMs,
+    countdownTotalMs: ui.countdownTotalMs,
+    intervalSeconds: ui.settings.intervalSeconds,
+    rows: ui.rows,
+  }, clockMs);
   const checkout = ui.settings.checkout;
 
   return (
@@ -62,14 +89,26 @@ export function AppHeader({
       <div className="mx-1 h-5 w-px shrink-0 bg-border" aria-hidden="true" />
 
       <div className="flex min-w-0 flex-1 items-center gap-2">
-        <div className="flex min-w-0 items-center gap-2 text-[13px]" role="status" aria-live="polite">
-          <span className="relative flex size-2 shrink-0" aria-hidden="true">
-            {run.tone === "running" ? (
-              <span className="absolute inline-flex size-full animate-ping rounded-full bg-in-stock opacity-40 motion-reduce:hidden" />
-            ) : null}
-            <span className={cn("relative inline-flex size-2 rounded-full", RUN_DOT[run.tone])} />
+        <div className="flex min-w-0 max-w-sm flex-1 items-center gap-2.5 text-[13px]">
+          <span className={cn("size-2 shrink-0 rounded-full", RUN_DOT[run.tone])} aria-hidden="true" />
+          {/* 只播报状态变化；每秒变化的剩余时间放在进度条的 aria-valuetext 里，按需读取。 */}
+          <span
+            role="status"
+            aria-live="polite"
+            className={cn("shrink-0 font-medium whitespace-nowrap", run.tone === "paused" && "text-muted-foreground")}
+          >
+            {run.label}
           </span>
-          <span className={cn("truncate font-medium tabular-nums", run.tone === "paused" && "text-muted-foreground")}>{run.label}</span>
+          {run.tone !== "paused" ? (
+            <>
+              <div className="min-w-12 flex-1">
+                <RunProgress status={run} resetKey={ui.nextCheckAtMs} />
+              </div>
+              <span className="shrink-0 text-xs whitespace-nowrap text-muted-foreground tabular-nums" aria-hidden="true">
+                {run.countdown}
+              </span>
+            </>
+          ) : null}
         </div>
 
         {checkout.enabled ? (
