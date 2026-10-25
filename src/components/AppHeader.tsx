@@ -5,6 +5,7 @@ import { BrandMark, GithubBrandIcon, XBrandIcon } from "@/components/BrandIcons"
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { describeSession } from "@/lib/monitorSession";
 import { describeRun, type RunStatus, type RunTone } from "@/lib/runStatus";
 import type { UiState } from "@/lib/store";
 import { openAuthorPage, openProjectPage, startWatching, stopWatching } from "@/lib/store";
@@ -112,21 +113,41 @@ export function AppHeader({
           ) : null}
         </div>
 
+        {ui.session ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                tabIndex={0}
+                aria-label={`本次监控已查询 ${ui.session.cycles} 轮${ui.session.hits > 0 ? `，有货 ${ui.session.hits} 次` : ""}`}
+                className="shrink-0 cursor-default rounded-sm border-l border-border pl-2.5 text-xs whitespace-nowrap text-muted-foreground tabular-nums focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
+              >
+                已查询 <span className="font-semibold text-foreground">{ui.session.cycles}</span> 轮
+                {ui.session.hits > 0 ? (
+                  <span className="font-medium text-in-stock"> · 有货 {ui.session.hits} 次</span>
+                ) : null}
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-80">{describeSession(ui.session, clockMs)}</TooltipContent>
+          </Tooltip>
+        ) : null}
+
         {checkout.enabled ? (
           <Tooltip>
             <TooltipTrigger asChild>
               <button
                 type="button"
                 onClick={onShowCheckout}
+                aria-label={checkout.placeOrder ? "自动结账已开启，会自动下单" : "自动结账已开启"}
                 className={cn(
-                  "ml-1 inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-xs font-medium whitespace-nowrap transition-colors",
+                  "ml-1 inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-xs font-medium whitespace-nowrap transition-colors max-[1000px]:px-1.5",
                   checkout.placeOrder
                     ? "bg-unknown/15 text-unknown-text hover:bg-unknown/25"
                     : "bg-primary/10 text-primary hover:bg-primary/15",
                 )}
               >
                 <ShoppingCart className="size-3.5" aria-hidden="true" />
-                {checkout.placeOrder ? "自动结账 · 会自动下单" : "自动结账已开启"}
+                {/* 窄窗口只留图标，给运行状态和查询次数让出位置；完整说明在悬浮提示里。 */}
+                <span className="max-[1000px]:hidden">{checkout.placeOrder ? "自动结账 · 会自动下单" : "自动结账已开启"}</span>
               </button>
             </TooltipTrigger>
             <TooltipContent className="max-w-72">

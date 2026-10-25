@@ -36,6 +36,7 @@ import type {
 } from "./types";
 import { assertNever, targetKey } from "./types";
 import { describeBrowserFailure, describeCycleRows, describeCycleSummary } from "./monitorLog";
+import { endSession, joinSession, recordCycle, startSession, type MonitorSession } from "./monitorSession";
 
 import { describeUpdateError, type UpdateProgress } from "./updateStatus";
 
@@ -51,6 +52,8 @@ export interface UiState {
   nextCheckAtMs: number | null;
   /** 这一段等待的总时长，顶栏进度条按它计算已走过的比例；与 nextCheckAtMs 同时设置和清空。 */
   countdownTotalMs: number | null;
+  /** 本次监控的查询统计；开始监控时重新计数，暂停后保留到下次开始。还没开始过为 null。 */
+  session: MonitorSession | null;
   /** 当前目标地区中是否仍有 Apple 请求保护冷却。 */
   cooling: boolean;
   /** 最近一轮实际使用的出口线路；跟随系统代理或尚未查询时为 null。 */
@@ -135,6 +138,7 @@ let state: UiState = {
   running: false,
   nextCheckAtMs: null,
   countdownTotalMs: null,
+  session: null,
   cooling: false,
   route: null,
   trouble: null,
@@ -196,6 +200,19 @@ function formatElapsed(ms: number): string {
   return `${(ms / 1_000).toFixed(1)} 秒`;
 }
 
+/**
+ * 运行状态翻转时一并开始或结束本次监控的统计。
+ *
+ * 开始监控既可能先由 start_watching 的返回值得知，也可能先收到 runStateChanged
+ * 事件；两条路都走这里，谁先到谁生效，另一条看到状态没变就什么都不做。
+ */
+function runningPatch(running: boolean): Partial<UiState> {
+  if (state.running === running) return {};
+  return running
+    ? { running, session: startSession(Date.now()) }
+    : { running, session: state.session ? endSession(state.session, Date.now()) : null };
+}
+
 function applyEvent(event: WatcherEvent): void {
   switch (event.type) {
     case "stateChanged": {
@@ -224,6 +241,7 @@ function applyEvent(event: WatcherEvent): void {
         rows: event.snapshot,
         nextCheckAtMs: Date.now() + event.nextCheckInSecs * 1_000,
         countdownTotalMs: event.nextCheckInSecs * 1_000,
+        session: recordCycle(state.session, event),
         cooling: event.cooling,
         route: event.route ?? null,
         // 只有引擎明说本轮健康，才收起告警。用「所有行都没错误」去反推是
@@ -254,7 +272,7 @@ function applyEvent(event: WatcherEvent): void {
     case "runStateChanged":
       if (state.running !== event.running) {
         update({
-          running: event.running,
+          ...runningPatch(event.running),
           nextCheckAtMs: event.running ? state.nextCheckAtMs : null,
           countdownTotalMs: event.running ? state.countdownTotalMs : null,
           cooling: event.running ? state.cooling : false,
@@ -296,7 +314,8 @@ export function connect(): Promise<void> {
       invoke<TargetState[]>("get_snapshot"),
       invoke<boolean>("is_running"),
     ]);
-    update({ regions, categories, settings, rows, running, ready: true });
+    // 界面打开时引擎已经在跑（例如刷新了窗口），本次监控从下一轮开始接着统计。
+    update({ regions, categories, settings, rows, running, session: running ? joinSession() : null, ready: true });
     await loadCatalog(settings.locale);
     // 启动时静默查一次。查不到就算了，不打扰用户 —— 网络不通、GitHub 抽风
     // 都会走到这里，跟「有没有新版本」是两回事。
@@ -474,7 +493,7 @@ export async function startWatching(): Promise<void> {
     await invoke("start_watching");
     const running = await invoke<boolean>("is_running");
     if (state.running !== running) {
-      update({ running });
+      update(runningPatch(running));
       pushLog(running ? "已开始监控。" : "启动命令已返回，但监控引擎没有进入运行状态。");
     }
   } catch (err) {
@@ -487,7 +506,7 @@ export async function stopWatching(): Promise<void> {
     await invoke("stop_watching");
     const running = await invoke<boolean>("is_running");
     if (state.running !== running) {
-      update({ running });
+      update(runningPatch(running));
       pushLog(running ? "暂停命令已返回，但监控引擎仍在运行。" : "已暂停监控。");
     }
   } catch (err) {
