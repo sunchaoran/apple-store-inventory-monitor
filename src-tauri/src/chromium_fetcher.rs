@@ -175,7 +175,7 @@ fn reclaim_orphaned_profile_process(profile_dir: &Path) -> Result<(), ApiError> 
     }
     if parent_pid != Some(1) {
         return Err(ApiError::Transport(
-            "另一个果到雷达实例正在使用专属 Chromium 会话，本轮未重复打开浏览器".into(),
+            "另一个拾果实例正在使用专属 Chromium 会话，本轮未重复打开浏览器".into(),
         ));
     }
 
@@ -1945,7 +1945,7 @@ impl QueryState {
                 if self.clash.is_some() && detail.contains("ERR_PROXY_CONNECTION_FAILED") =>
             {
                 ApiError::Transport(format!(
-                    "无法连接 Clash 专用端口 {}，请确认 Clash 正在运行并已加载果到雷达的扩展脚本",
+                    "无法连接 Clash 专用端口 {}，请确认 Clash 正在运行并已加载拾果的扩展脚本",
                     self.network.clash.proxy_port
                 ))
             }

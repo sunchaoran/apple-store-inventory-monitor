@@ -34,7 +34,7 @@ export function StatusAlerts({
               {describeBrowserRecovery(browserFailure).map((step) => <li key={step}>{step}</li>)}
             </ol>
             <span className="text-xs text-muted-foreground">
-              仍无法恢复时，请把“查看详情”中的错误信息、果到雷达版本和浏览器版本通过项目的 GitHub Issues 反馈。
+              仍无法恢复时，请把“查看详情”中的错误信息、拾果版本和浏览器版本通过项目的 GitHub Issues 反馈。
               {ui.running ? "运行中仍会按设置的间隔尝试连接。" : "当前监控已暂停。"}
             </span>
             <div className="mt-1 flex flex-wrap items-center gap-4">

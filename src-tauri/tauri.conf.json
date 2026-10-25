@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "果到雷达",
+  "productName": "拾果",
   "version": "1.0.24",
   "identifier": "com.suversal.apple-store-inventory-monitor",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "果到雷达",
+        "title": "拾果",
         "width": 1080,
         "height": 820,
         "minWidth": 900,

@@ -191,7 +191,7 @@ pub enum NetworkMode {
 /// Clash / mihomo 线路设置。
 ///
 /// 应用只切换 `group` 这一个策略组的节点，并且只让查询浏览器走 `proxy_port`。
-/// 这要求用户为果到雷达单独配置策略组和监听端口，切换节点才不会改变电脑上
+/// 这要求用户为拾果单独配置策略组和监听端口，切换节点才不会改变电脑上
 /// 其他软件的代理出口。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]

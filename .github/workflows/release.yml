@@ -272,7 +272,7 @@ jobs:
             若确认文件来自本仓库 Release 后仍需移除下载隔离标记，可执行：
 
             ```sh
-            xattr -cr "/Applications/果到雷达.app"
+            xattr -cr "/Applications/拾果.app"
             ```
 
             这条命令只移除该应用的下载隔离标记，不会关闭系统的全局安全功能。
@@ -372,7 +372,7 @@ jobs:
           }
           trap cleanup EXIT
           hdiutil attach -readonly -nobrowse -mountpoint "$mount_path" "$dmg_path" >/dev/null
-          verify_app "$mount_path/果到雷达.app"
+          verify_app "$mount_path/拾果.app"
 
           tar -xzf "$archive_path" -C "$archive_dir"
           archived_app="$(find "$archive_dir" -maxdepth 1 -name '*.app' -print -quit)"

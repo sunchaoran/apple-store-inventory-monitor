@@ -57,7 +57,7 @@ export function AppHeader({
         <div className="flex size-8 items-center justify-center rounded-lg bg-primary/10 text-primary" aria-hidden="true">
           <Radar className="size-[18px]" strokeWidth={2} />
         </div>
-        <h1 className="text-[15px] font-semibold tracking-tight">果到雷达</h1>
+        <h1 className="text-[15px] font-semibold tracking-tight">拾果</h1>
         <span className="text-xs text-muted-foreground tabular-nums max-[1000px]:hidden">v{packageInfo.version}</span>
       </div>
 
