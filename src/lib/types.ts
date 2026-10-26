@@ -53,6 +53,34 @@ export interface TargetState {
   pickupDetails?: PickupDetails;
   lastCheckedMs: number | null;
   consecutiveFailures: number;
+  /** 最近一段到货记录：正在有货，或者上一次有货。还没查到过有货时省略。 */
+  sighting?: Sighting;
+}
+
+/**
+ * 一段连续确认有货的时间，也就是一条到货记录。与 Rust 侧 `Sighting` 对应。
+ *
+ * Apple 的取货接口不给库存数量，记录的是时间：持续多久本身就能看出货多不多。
+ */
+export interface Sighting {
+  /** 第一次确认有货的时刻。 */
+  sinceMs: number;
+  /** 最近一次确认有货的时刻。 */
+  lastSeenMs: number;
+  /** 收尾的时刻：确认没货的那一轮，或者停止查询的那一刻。还有货时省略。 */
+  endedMs?: number;
+  /** 停止查询时仍有货，真正没货的时间不得而知。 */
+  interrupted?: boolean;
+  /** 这段时间里确认有货的轮数。 */
+  rounds: number;
+  /** 刚有货时 Apple 的取货说明，例如「今天可取货」。 */
+  pickupQuote?: string;
+}
+
+/** 一条到货记录：哪个门店的哪个型号，什么时候有过货。与 Rust 侧 `SightingRecord` 对应。 */
+export interface SightingRecord {
+  target: Target;
+  sighting: Sighting;
 }
 
 export interface Region {
@@ -297,6 +325,7 @@ export interface BlockedRoute {
 export type WatcherEvent =
   | { type: "stateChanged"; state: TargetState }
   | { type: "inStock"; state: TargetState }
+  | ({ type: "sightingEnded" } & SightingRecord)
   | { type: "cycleStarted"; cycle: number; storeCount: number; targetCount: number }
   | {
       type: "cycleComplete";
@@ -306,7 +335,7 @@ export type WatcherEvent =
       reusedResponseCount: number;
       nextCheckInSecs: number;
       cooling: boolean;
-      /** 下一次是整点或半点的定点查询。 */
+      /** 下一次是定点查询。 */
       alignedCheck: boolean;
       /** 本轮使用的出口线路；跟随系统代理时省略。 */
       route?: string;

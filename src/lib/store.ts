@@ -27,6 +27,7 @@ import type {
   Region,
   RouteList,
   Settings,
+  SightingRecord,
   Store,
   Target,
   TargetState,
@@ -40,6 +41,7 @@ import { assertNever, targetKey } from "./types";
 import { describeBrowserFailure, describeCycleRows, describeCycleSummary } from "./monitorLog";
 import { endSession, joinSession, recordCycle, startSession, type MonitorSession } from "./monitorSession";
 import { describeMark, formatWait } from "./runStatus";
+import { addSighting } from "./sightings";
 
 import { describeUpdateError, type UpdateProgress } from "./updateStatus";
 
@@ -71,6 +73,8 @@ export interface UiState {
   /** 非 null 表示「当前的状态不可信」，界面要挂一条持续可见的告警。 */
   trouble: Trouble | null;
   logs: string[];
+  /** 已经结束的到货记录，从旧到新；还在有货的那一段在 rows 的快照里。 */
+  stockHistory: SightingRecord[];
   regions: Region[];
   categories: CategoryOption[];
   stores: Store[];
@@ -158,6 +162,7 @@ let state: UiState = {
   checkoutSignIn: null,
   trouble: null,
   logs: [],
+  stockHistory: [],
   regions: [],
   categories: [],
   stores: [],
@@ -240,6 +245,11 @@ function applyEvent(event: WatcherEvent): void {
 
     case "inStock":
       // 到货动作由 Rust 宿主执行；逐项查询结果在 CycleComplete 时统一写日志。
+      break;
+
+    case "sightingEnded":
+      // 宿主已经写进历史文件，这里同步一份，不必再去读一次。
+      update({ stockHistory: addSighting(state.stockHistory, { target: event.target, sighting: event.sighting }) });
       break;
 
     case "cycleStarted":
@@ -327,15 +337,26 @@ export function connect(): Promise<void> {
       listen<CheckoutSignIn>(CHECKOUT_SIGN_IN_CHANNEL, (e) => update({ checkoutSignIn: e.payload })),
     ]);
 
-    const [regions, categories, settings, rows, running] = await Promise.all([
+    const [regions, categories, settings, rows, running, stockHistory] = await Promise.all([
       invoke<Region[]>("list_regions"),
       invoke<CategoryOption[]>("list_categories"),
       invoke<Settings>("get_settings"),
       invoke<TargetState[]>("get_snapshot"),
       invoke<boolean>("is_running"),
+      // 到货历史只是回顾用，读不出来也不能挡住界面。
+      invoke<SightingRecord[]>("get_stock_history").catch(() => []),
     ]);
     // 界面打开时引擎已经在跑（例如刷新了窗口），本次监控从下一轮开始接着统计。
-    update({ regions, categories, settings, rows, running, session: running ? joinSession() : null, ready: true });
+    update({
+      regions,
+      categories,
+      settings,
+      rows,
+      running,
+      stockHistory: Array.isArray(stockHistory) ? stockHistory : [],
+      session: running ? joinSession() : null,
+      ready: true,
+    });
     await loadCatalog(settings.locale);
     // 启动时静默查一次。查不到就算了，不打扰用户 —— 网络不通、GitHub 抽风
     // 都会走到这里，跟「有没有新版本」是两回事。

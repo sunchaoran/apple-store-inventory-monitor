@@ -15,9 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use apw_core::catalog::Catalog;
 use apw_core::config::{ClashSettings, MIN_INTERVAL_SECONDS, OpenOnHit, Settings, SettingsStore};
+use apw_core::history::SightingLog;
 use apw_core::model::{Category, Product, REGIONS, Store, Target, region_by_locale};
 use apw_core::notify::{Bark, BarkPush, Multi, Notification, Notifier, Sound};
-use apw_core::watcher::{Event, TargetState, Watcher, WatcherConfig};
+use apw_core::watcher::{Event, SightingRecord, TargetState, Watcher, WatcherConfig};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -326,6 +327,9 @@ struct AppState {
     checkout_keeper: AtomicBool,
     /// 上次确认到的登录状态：0 未知、1 已登录、2 未登录。只在变化时提醒。
     checkout_signed_in: AtomicU8,
+    /// 到货历史，从旧到新。为 `None` 的文件表示找不到配置目录，只记在内存里。
+    stock_history: StdMutex<Vec<SightingRecord>>,
+    stock_history_log: Option<SightingLog>,
 }
 
 /// 下单浏览器里 Apple 账户的登录检查结果，推给界面。
@@ -346,6 +350,23 @@ impl AppState {
 
     /// 先落盘再更新内存副本。否则 Windows 上文件被占用或权限异常时，
     /// 界面、监控引擎和下次启动读到的设置会变成三份不同的状态。
+    /// 记下一段结束的到货。写盘失败只影响重启后能否看到，不打断事件处理。
+    fn record_sighting(&self, record: SightingRecord) {
+        let mut history = self.stock_history.lock().unwrap_or_else(|e| e.into_inner());
+        match &self.stock_history_log {
+            Some(log) => {
+                if let Err(error) = log.append(&mut history, record) {
+                    eprintln!("写入到货历史失败（{}）：{error}", log.path().display());
+                }
+            }
+            None => {
+                history.push(record);
+                let overflow = history.len().saturating_sub(apw_core::history::MAX_RECORDS);
+                history.drain(..overflow);
+            }
+        }
+    }
+
     fn put_settings(&self, next: Settings) -> Result<(), String> {
         if let Some(store) = &self.store {
             store.save(&next).map_err(|e| e.to_string())?;
@@ -813,6 +834,16 @@ async fn select_clash_node(
     node: String,
 ) -> Result<Option<u32>, String> {
     state.fetcher.select_route(&node).await
+}
+
+/// 已经结束的到货记录，从旧到新。还在有货的那一段在快照里。
+#[tauri::command]
+fn get_stock_history(state: tauri::State<'_, AppState>) -> Vec<SightingRecord> {
+    state
+        .stock_history
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 #[tauri::command]
@@ -1617,6 +1648,11 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
             Event::Trouble { .. } => {
                 checkout_audit("trouble", serde_json::json!({"needsInspection": true}))
             }
+            Event::SightingEnded(record) => {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.record_sighting(record.clone());
+                }
+            }
             Event::StateChanged { .. } => {}
         }
 
@@ -1845,6 +1881,7 @@ pub fn run() {
         .setup(|app| {
             let mut notices = Vec::new();
             let (mut settings, store) = load_settings(&mut notices);
+            let stock_history_log = SightingLog::new().ok();
             // 在线刷新过的门店和型号缓存在设置目录旁边，重启后优先使用。
             let catalog = Catalog::with_cache_dir(
                 dirs::config_dir()
@@ -1909,6 +1946,13 @@ pub fn run() {
                 store,
                 checkout_keeper: AtomicBool::new(false),
                 checkout_signed_in: AtomicU8::new(0),
+                stock_history: StdMutex::new(
+                    stock_history_log
+                        .as_ref()
+                        .map(SightingLog::load)
+                        .unwrap_or_default(),
+                ),
+                stock_history_log,
             });
 
             let handle: AppHandle = app.handle().clone();
@@ -1954,6 +1998,7 @@ pub fn run() {
             list_clash_nodes,
             select_clash_node,
             get_snapshot,
+            get_stock_history,
             set_targets,
             set_interval,
             start_watching,

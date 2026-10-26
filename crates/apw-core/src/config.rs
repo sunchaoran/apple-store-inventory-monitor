@@ -232,7 +232,7 @@ pub const MAX_SETTINGS_BYTES: usize = 1 << 20;
 ///
 /// 上游把 `user_settings.json` 直接写在进程工作目录。打包成 macOS `.app` 之后，
 /// 工作目录取决于应用被如何启动，可能是 `/` 这种不可写的位置，设置会静默丢失。
-const APP_DIR: &str = "apple-store-inventory-monitor";
+pub(crate) const APP_DIR: &str = "apple-store-inventory-monitor";
 
 /// 改名前版本使用的配置目录。只用于首次迁移，不会写入或删除。
 const PREVIOUS_APP_DIR: &str = "apple-pickup-watcher";
@@ -927,7 +927,7 @@ fn parent_dir(path: &Path) -> &Path {
 ///
 /// 关键在于内存占用被这个上限钉死了，与文件实际大小无关 —— 这正是 Go 版
 /// `os.ReadFile` 缺的那一环。
-fn read_capped<R: Read>(reader: R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+pub(crate) fn read_capped<R: Read>(reader: R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     let mut capped = reader.take(limit as u64 + 1);
     capped.read_to_end(&mut buf)?;
@@ -1001,7 +1001,7 @@ fn create_temp_file(dir: &Path) -> Result<(TempFile, File), ConfigError> {
 /// 直接往目标文件上写的话，写到一半崩溃或断电就会留下半截 JSON，下次启动直接
 /// 解析失败 —— 用户的监控列表就这么没了。改名在同一个文件系统内是原子的：
 /// 任何时刻去读，看到的要么是完整的旧内容，要么是完整的新内容。
-fn write_atomically(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
+pub(crate) fn write_atomically(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
     let dir = parent_dir(path);
     fs::create_dir_all(dir).map_err(|e| ConfigError::io("创建配置目录", dir, e))?;
     harden_config_dir(dir)?;

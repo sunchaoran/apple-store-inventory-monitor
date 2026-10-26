@@ -16,6 +16,7 @@ import {
   groupMonitorsByProduct,
   type MonitorFilter,
 } from "@/lib/monitorGroups";
+import { describeRowSighting, latestSightings } from "@/lib/sightings";
 import { formatTime, targetKey, type Target } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -94,7 +95,7 @@ function EmptyState({ ready, onAdd }: { ready: boolean; onAdd: () => void }) {
   );
 }
 
-export function MonitorList({ ui }: { ui: UiState }) {
+export function MonitorList({ ui, nowMs }: { ui: UiState; nowMs: number }) {
   const [addOpen, setAddOpen] = useState(false);
   const [filter, setFilter] = useState<MonitorFilter>("all");
   const [removingTargetKeys, setRemovingTargetKeys] = useState<Set<string>>(() => new Set());
@@ -113,6 +114,8 @@ export function MonitorList({ ui }: { ui: UiState }) {
     inStock: group.rows.filter((row) => row.availability.kind === "in_stock").length,
   }])), [groups]);
   const counts = useMemo(() => countByFilter(ui.rows), [ui.rows]);
+  // 每个门店最近一段到货：正在有货从几点起，或者上次有货是什么时候。
+  const sightings = useMemo(() => latestSightings(ui.stockHistory, ui.rows), [ui.stockHistory, ui.rows]);
   // 当前筛选项被清空（例如有货的那一项恢复成无货）时回到全部，免得列表莫名变空；
   // 同时重置筛选本身，之后再出现同类状态时不会自己又切回去。
   const activeFilter = filter !== "all" && counts[filter] === 0 ? "all" : filter;
@@ -250,6 +253,7 @@ export function MonitorList({ ui }: { ui: UiState }) {
                   {group.rows.map((row) => {
                     const rowKey = targetKey(row.target);
                     const removing = removingTargetKeys.has(rowKey);
+                    const sighting = sightings.get(rowKey);
                     return (
                       <tr key={rowKey} className="group transition-colors hover:bg-accent/50">
                         <td className="border-b border-border/70 py-2 pl-4">
@@ -264,6 +268,17 @@ export function MonitorList({ ui }: { ui: UiState }) {
                             <div className="mt-0.5 flex min-w-0">
                               <DeliverySummary pickupDetails={row.pickupDetails} checkedMs={row.lastCheckedMs} expected={false} />
                             </div>
+                          ) : null}
+                          {sighting ? (
+                            <p
+                              className={cn(
+                                "mt-0.5 truncate text-xs text-muted-foreground tabular-nums",
+                                sighting.endedMs === undefined && "font-medium text-in-stock",
+                              )}
+                              title={sighting.pickupQuote}
+                            >
+                              {describeRowSighting(sighting, nowMs)}
+                            </p>
                           ) : null}
                         </td>
                         <td className="border-b border-border/70 px-3 py-2 text-right font-mono text-xs text-muted-foreground tabular-nums">

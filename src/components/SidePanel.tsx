@@ -1,17 +1,19 @@
 import { ActivityLog } from "@/components/ActivityLog";
+import { StockHistory } from "@/components/StockHistory";
 import { AlertSettings } from "@/components/settings/AlertSettings";
 import { CheckoutSettings } from "@/components/settings/CheckoutSettings";
 import { QuerySettings } from "@/components/settings/QuerySettings";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { MAX_SIGHTINGS, listSightings } from "@/lib/sightings";
 import type { UiState } from "@/lib/store";
 import { cn } from "@/lib/utils";
 
-export type SideTab = "log" | "alerts" | "query" | "checkout";
+export type SideTab = "log" | "stock" | "alerts" | "query" | "checkout";
 
-export const SIDE_TABS: readonly SideTab[] = ["log", "alerts", "query", "checkout"];
+export const SIDE_TABS: readonly SideTab[] = ["log", "stock", "alerts", "query", "checkout"];
 
 /**
- * 右侧面板：活动日志与三组设置分页显示。
+ * 右侧面板：活动日志、到货记录与三组设置分页显示。
  *
  * 以前设置面板和日志排成一长列，日志被挤到三屏之外。现在日志默认可见，
  * 设置按用途分页。所有分页保持挂载，切换分页时不会丢掉正在填写的内容，
@@ -19,18 +21,22 @@ export const SIDE_TABS: readonly SideTab[] = ["log", "alerts", "query", "checkou
  */
 export function SidePanel({
   ui,
+  nowMs,
   tab,
   onTabChange,
 }: {
   ui: UiState;
+  nowMs: number;
   tab: SideTab;
   onTabChange: (tab: SideTab) => void;
 }) {
   const checkout = ui.settings.checkout;
+  const sightings = listSightings(ui.stockHistory, ui.rows);
+  const stockingNow = ui.rows.some((row) => row.sighting !== undefined && row.sighting.endedMs === undefined);
   const settingsPage = "scroll-quiet min-h-0 overflow-y-auto px-4 py-4 data-[state=inactive]:hidden";
 
   return (
-    <aside className="panel flex min-h-0 min-w-0 flex-col overflow-hidden" aria-label="活动日志与设置">
+    <aside className="panel flex min-h-0 min-w-0 flex-col overflow-hidden" aria-label="活动日志、到货记录与设置">
       <Tabs
         value={tab}
         onValueChange={(value) => onTabChange(value as SideTab)}
@@ -39,6 +45,10 @@ export function SidePanel({
         <div className="shrink-0 border-b border-border p-2.5">
           <TabsList className="w-full">
             <TabsTrigger value="log">活动日志</TabsTrigger>
+            <TabsTrigger value="stock">
+              到货
+              {stockingNow ? <span className="size-1.5 rounded-full bg-in-stock" aria-label="正在有货" /> : null}
+            </TabsTrigger>
             <TabsTrigger value="alerts">提醒</TabsTrigger>
             <TabsTrigger value="query">查询</TabsTrigger>
             <TabsTrigger value="checkout">
@@ -57,6 +67,12 @@ export function SidePanel({
           <ActivityLog logs={ui.logs} active={tab === "log"} />
           <p className="shrink-0 border-t border-border px-4 py-2 text-xs text-muted-foreground tabular-nums">
             共 {ui.logs.length} 条，只保留最近 300 条
+          </p>
+        </TabsContent>
+        <TabsContent forceMount value="stock" className="flex min-h-0 flex-col data-[state=inactive]:hidden">
+          <StockHistory records={sightings} nowMs={nowMs} />
+          <p className="shrink-0 border-t border-border px-4 py-2 text-xs text-muted-foreground tabular-nums">
+            共 {sightings.length} 条，只保留最近 {MAX_SIGHTINGS} 条
           </p>
         </TabsContent>
         <TabsContent forceMount value="alerts" className={settingsPage}>

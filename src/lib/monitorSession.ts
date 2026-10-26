@@ -15,7 +15,7 @@ export interface MonitorSession {
   cycles: number;
   /** 实际发往 Apple 的请求数，同地区复用的响应不计入。 */
   requests: number;
-  /** 查到有货的次数：每轮每个有货的监控项记一次。 */
+  /** 查到有货的次数：同一个监控项连续几轮都有货只算一次，即到货记录的条数。 */
   hits: number;
 }
 
@@ -34,14 +34,15 @@ export function endSession(session: MonitorSession, nowMs: number): MonitorSessi
 
 export function recordCycle(
   session: MonitorSession | null,
-  cycle: { cycle: number; requestCount: number; snapshot: Pick<TargetState, "availability">[] },
+  cycle: { cycle: number; requestCount: number; snapshot: Pick<TargetState, "sighting">[] },
 ): MonitorSession {
   const base = session ?? joinSession();
   return {
     ...base,
     cycles: Math.max(base.cycles, cycle.cycle),
     requests: base.requests + cycle.requestCount,
-    hits: base.hits + cycle.snapshot.filter((row) => row.availability.kind === "in_stock").length,
+    // 一段到货在开始的那一轮轮数为 1，只在那一轮记一次。
+    hits: base.hits + cycle.snapshot.filter((row) => row.sighting?.endedMs === undefined && row.sighting?.rounds === 1).length,
   };
 }
 

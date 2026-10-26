@@ -65,6 +65,7 @@ export function AppHeader({
   isQuerying,
   onQueryNow,
   onShowCheckout,
+  onShowStock,
 }: {
   ui: UiState;
   clockMs: number;
@@ -73,6 +74,7 @@ export function AppHeader({
   isQuerying: boolean;
   onQueryNow: () => void;
   onShowCheckout: () => void;
+  onShowStock: () => void;
 }) {
   const alignedOnly = ui.settings.alignedOnly && ui.settings.alignedChecks.length > 0;
   // 还没有下一轮时间，或者时间已到、新一轮还没报上来：本轮正在查，立即查询没有意义。
@@ -125,18 +127,19 @@ export function AppHeader({
         {ui.session ? (
           <Tooltip>
             <TooltipTrigger asChild>
-              <span
-                tabIndex={0}
-                aria-label={`本次监控已查询 ${ui.session.cycles} 轮${ui.session.hits > 0 ? `，有货 ${ui.session.hits} 次` : ""}`}
-                className="shrink-0 cursor-default rounded-sm border-l border-border pl-2.5 text-xs whitespace-nowrap text-muted-foreground tabular-nums focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
+              <button
+                type="button"
+                onClick={onShowStock}
+                aria-label={`本次监控已查询 ${ui.session.cycles} 轮${ui.session.hits > 0 ? `，有货 ${ui.session.hits} 次` : ""}，查看到货记录`}
+                className="shrink-0 rounded-sm border-l border-border pl-2.5 text-xs whitespace-nowrap text-muted-foreground tabular-nums transition-colors hover:text-foreground focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
               >
                 已查询 <span className="font-semibold text-foreground">{ui.session.cycles}</span> 轮
                 {ui.session.hits > 0 ? (
                   <span className="font-medium text-in-stock"> · 有货 {ui.session.hits} 次</span>
                 ) : null}
-              </span>
+              </button>
             </TooltipTrigger>
-            <TooltipContent className="max-w-80">{describeSession(ui.session, clockMs)}</TooltipContent>
+            <TooltipContent className="max-w-80">{describeSession(ui.session, clockMs)}点击查看到货记录。</TooltipContent>
           </Tooltip>
         ) : null}
 

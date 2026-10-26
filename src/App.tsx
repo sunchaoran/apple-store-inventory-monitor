@@ -46,6 +46,9 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [ui.running]);
 
+  // 暂停时上面的时钟不走；到货记录里的「今天」「昨天」仍要按此刻算。
+  const nowMs = ui.running ? clockMs : Date.now();
+
   function changeSideTab(tab: SideTab) {
     setSideTab(tab);
     writeSideTab(tab);
@@ -81,11 +84,12 @@ export default function App() {
           isQuerying={isQuerying}
           onQueryNow={() => void onQueryNow()}
           onShowCheckout={() => changeSideTab("checkout")}
+          onShowStock={() => changeSideTab("stock")}
         />
         <StatusAlerts ui={ui} clockMs={clockMs} isRetrying={isRetrying} onRetryNow={() => void onRetryNow()} />
         <main className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_20rem] gap-4 p-4 min-[1000px]:grid-cols-[minmax(0,1fr)_22rem] min-[1240px]:grid-cols-[minmax(0,1fr)_25rem] max-[860px]:grid-cols-1 max-[860px]:grid-rows-[minmax(26rem,1fr)_minmax(26rem,1fr)] max-[860px]:overflow-y-auto">
-          <MonitorList ui={ui} />
-          <SidePanel ui={ui} tab={sideTab} onTabChange={changeSideTab} />
+          <MonitorList ui={ui} nowMs={nowMs} />
+          <SidePanel ui={ui} nowMs={nowMs} tab={sideTab} onTabChange={changeSideTab} />
         </main>
       </div>
     </TooltipProvider>

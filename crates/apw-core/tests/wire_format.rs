@@ -12,7 +12,7 @@
 use apw_core::apple::BlockedRoute;
 use apw_core::config::OpenOnHit;
 use apw_core::model::{Availability, Category, Product, Store, Target, UnknownReason};
-use apw_core::watcher::{Event, TroubleAdvice};
+use apw_core::watcher::{Event, Sighting, SightingRecord, TroubleAdvice};
 use serde_json::json;
 
 fn to_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
@@ -333,4 +333,53 @@ fn 缺失型号与业务说明的前端协议稳定() {
         to_value(&detail),
         json!({"pickupDisplay":"ineligible","pickupQuote":"暂不提供取货","saleReason":"NOT_FOR_SALE","saleMessage":"暂未发售"})
     );
+}
+
+#[test]
+fn 到货记录的线上格式() {
+    let record = SightingRecord {
+        target: Target {
+            locale: "zh_CN".into(),
+            store_number: "R359".into(),
+            store_title: "南京东路".into(),
+            part_number: "MG6W4CH/A".into(),
+            product_name: "iPhone 17 256GB 黑色".into(),
+            companion_part: None,
+            companion_name: None,
+            kit_part: None,
+            pickup_location: None,
+        },
+        sighting: Sighting {
+            since_ms: 1_000,
+            last_seen_ms: 61_000,
+            ended_ms: None,
+            interrupted: false,
+            rounds: 3,
+            pickup_quote: Some("今天可取货".into()),
+        },
+    };
+    // 还在有货：没有结束时间，也不带 interrupted。
+    assert_eq!(
+        to_value(&record.sighting),
+        json!({"sinceMs": 1_000, "lastSeenMs": 61_000, "rounds": 3, "pickupQuote": "今天可取货"})
+    );
+    let paused = Sighting {
+        ended_ms: Some(90_000),
+        interrupted: true,
+        pickup_quote: None,
+        ..record.sighting.clone()
+    };
+    assert_eq!(
+        to_value(&paused),
+        json!({"sinceMs": 1_000, "lastSeenMs": 61_000, "endedMs": 90_000, "interrupted": true, "rounds": 3})
+    );
+
+    let event = to_value(&Event::SightingEnded(record.clone()));
+    assert_eq!(event["type"], "sightingEnded");
+    assert_eq!(event["target"]["storeNumber"], "R359");
+    assert_eq!(event["sighting"]["sinceMs"], 1_000);
+
+    // 宿主把记录原样写进历史文件，必须能读回来。
+    let back: SightingRecord = serde_json::from_value(to_value(&record)).expect("历史记录读不回来");
+    assert_eq!(back, record);
 }

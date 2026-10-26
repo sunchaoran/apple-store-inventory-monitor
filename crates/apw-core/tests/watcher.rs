@@ -1355,3 +1355,149 @@ async fn 只做定点查询时立即查询马上查一轮且不清除保护冷�
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
 }
+
+/// 收下等到的事件里所有结束的到货记录。
+fn ended_sightings(events: Vec<Event>) -> Vec<apw_core::watcher::SightingRecord> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::SightingEnded(record) => Some(record),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn 连续有货记成一段到货_查询失败不打断_确认没货才收尾() {
+    let fake = FakeFetcher::new(|nth, store, parts| match nth {
+        0 | 1 | 3 => Ok(ok_response(store, parts, Availability::InStock)),
+        2 => Err(ApiError::RateLimited("HTTP 541".into())),
+        _ => Ok(ok_response(store, parts, Availability::OutOfStock)),
+    });
+    let (watcher, mut rx) = Watcher::spawn(fake, fast_config());
+    watcher.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    watcher.start().await;
+
+    let mut sightings = Vec::new();
+    let mut ended = Vec::new();
+    for _ in 0..5 {
+        for event in wait_cycle(&mut rx).await {
+            match event {
+                Event::SightingEnded(record) => ended.push(record),
+                Event::CycleComplete { snapshot, .. } => {
+                    sightings.push(snapshot[0].sighting.clone())
+                }
+                _ => {}
+            }
+        }
+    }
+    watcher.stop().await;
+    let mut late = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        late.push(event);
+    }
+    assert!(
+        ended_sightings(late).is_empty(),
+        "已经收尾的记录不该在暂停时再收一次"
+    );
+
+    let first = sightings[0].clone().expect("第一轮有货就开始记录");
+    assert_eq!((first.rounds, first.ended_ms), (1, None));
+    assert_eq!(first.since_ms, first.last_seen_ms);
+    assert_eq!(sightings[1].as_ref().map(|s| s.rounds), Some(2));
+    assert_eq!(sightings[2], sightings[1], "查询失败既不延长也不结束");
+    let resumed = sightings[3].clone().unwrap();
+    assert_eq!(
+        (resumed.since_ms, resumed.rounds, resumed.ended_ms),
+        (first.since_ms, 3, None),
+        "失败之后又查到有货，仍是同一段"
+    );
+    let finished = sightings[4].clone().unwrap();
+    assert!(finished.ended_ms.is_some() && !finished.interrupted);
+    assert_eq!(finished.last_seen_ms, resumed.last_seen_ms);
+    assert_eq!(ended.len(), 1, "一段到货只收尾一次");
+    assert_eq!(ended[0].sighting, finished);
+    assert_eq!(ended[0].target.store_number, "R683");
+}
+
+#[tokio::test]
+async fn 暂停监控时把进行中的到货收尾_再开始另起一段() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let config = WatcherConfig {
+        interval: Duration::from_secs(30),
+        ..fast_config()
+    };
+    let (watcher, mut rx) = Watcher::spawn(fake, config);
+    watcher.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    watcher.start().await;
+    wait_cycle(&mut rx).await;
+
+    watcher.stop().await;
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    let ended = ended_sightings(events);
+    assert_eq!(ended.len(), 1);
+    let paused = &ended[0].sighting;
+    assert!(
+        paused.interrupted && paused.ended_ms.is_some(),
+        "{paused:?}"
+    );
+
+    watcher.start().await;
+    let events = wait_cycle(&mut rx).await;
+    let fresh = events
+        .iter()
+        .find_map(|event| match event {
+            Event::CycleComplete { snapshot, .. } => snapshot[0].sighting.clone(),
+            _ => None,
+        })
+        .expect("重新开始后查到有货要另起一段");
+    assert_eq!((fresh.rounds, fresh.ended_ms), (1, None));
+    assert!(fresh.since_ms >= paused.ended_ms.unwrap());
+    watcher.stop().await;
+}
+
+#[tokio::test]
+async fn 删掉还在有货的监控也会留下到货记录() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::InStock)));
+    let config = WatcherConfig {
+        interval: Duration::from_secs(30),
+        ..fast_config()
+    };
+    let (watcher, mut rx) = Watcher::spawn(fake, config);
+    watcher
+        .set_targets(vec![
+            target("R683", "MG724CH/A"),
+            target("R448", "MG0A4CH/A"),
+        ])
+        .await;
+    watcher.start().await;
+    wait_cycle(&mut rx).await;
+
+    watcher.set_targets(vec![target("R448", "MG0A4CH/A")]).await;
+    let record = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(Event::SightingEnded(record)) = rx.recv().await {
+                return record;
+            }
+        }
+    })
+    .await
+    .expect("删掉的监控应留下到货记录");
+    assert_eq!(record.target.store_number, "R683");
+    assert!(record.sighting.interrupted);
+    let kept = watcher.snapshot().await;
+    assert_eq!(kept.len(), 1);
+    assert!(
+        kept[0]
+            .sighting
+            .as_ref()
+            .is_some_and(|s| s.ended_ms.is_none()),
+        "留下的监控照常记录"
+    );
+    watcher.stop().await;
+}

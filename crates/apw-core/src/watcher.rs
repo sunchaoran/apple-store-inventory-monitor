@@ -58,6 +58,9 @@ pub struct TargetState {
     pub last_checked_ms: Option<u64>,
     /// 连续失败次数，供界面展示。
     pub consecutive_failures: u32,
+    /// 最近一段到货记录：正在有货，或者上一次有货。还没查到过有货时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sighting: Option<Sighting>,
 }
 
 impl TargetState {
@@ -68,8 +71,82 @@ impl TargetState {
             pickup_details: None,
             last_checked_ms: None,
             consecutive_failures: 0,
+            sighting: None,
         }
     }
+
+    /// 按本轮结果更新到货记录；Apple 明确答复没货时收尾，返回刚结束的那一段。
+    ///
+    /// 查询失败（被拦截、网络错误）既不延长也不结束：一次拦截不能把同一波到货
+    /// 拆成两段，也不能让结束时间提前。
+    fn track_sighting(&mut self, now: u64) -> Option<Sighting> {
+        if self.availability.is_in_stock() {
+            match self.sighting.as_mut().filter(|s| s.ended_ms.is_none()) {
+                Some(sighting) => {
+                    sighting.last_seen_ms = now;
+                    sighting.rounds = sighting.rounds.saturating_add(1);
+                }
+                None => {
+                    self.sighting = Some(Sighting {
+                        since_ms: now,
+                        last_seen_ms: now,
+                        ended_ms: None,
+                        interrupted: false,
+                        rounds: 1,
+                        pickup_quote: self
+                            .pickup_details
+                            .as_ref()
+                            .and_then(|details| details.pickup_quote.clone()),
+                    });
+                }
+            }
+            None
+        } else if self.availability.is_failure() {
+            None
+        } else {
+            self.end_sighting(now, false)
+        }
+    }
+
+    /// 结束还在进行的那段到货记录并返回它；没有进行中的就什么也不做。
+    fn end_sighting(&mut self, now: u64, interrupted: bool) -> Option<Sighting> {
+        let sighting = self.sighting.as_mut().filter(|s| s.ended_ms.is_none())?;
+        sighting.ended_ms = Some(now);
+        sighting.interrupted = interrupted;
+        Some(sighting.clone())
+    }
+}
+
+/// 一段连续确认有货的时间，也就是一条到货记录。
+///
+/// Apple 的取货接口只说有没有货、给一句取货说明，不给数量，所以记录的是时间：
+/// 什么时候开始有、最后一次确认还有、什么时候没了。持续多久本身就能看出货多不多。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sighting {
+    /// 第一次确认有货的那一轮完成的时刻（Unix 毫秒）。
+    pub since_ms: u64,
+    /// 最近一次确认有货的时刻。
+    pub last_seen_ms: u64,
+    /// 收尾的时刻：第一次确认没货的那一轮，或者停止查询的那一刻。还有货时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
+    /// 停止查询（暂停监控、删掉这条监控）时仍然有货，真正没货的时间不得而知。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
+    /// 这段时间里确认有货的轮数。
+    pub rounds: u32,
+    /// 刚有货时 Apple 的取货说明，例如「今天可取货」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_quote: Option<String>,
+}
+
+/// 一条结束了的到货记录：哪个门店的哪个型号，什么时候有过货。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SightingRecord {
+    pub target: Target,
+    pub sighting: Sighting,
 }
 
 /// 引擎向外发出的事件。
@@ -84,6 +161,10 @@ pub enum Event {
     /// `send().await`，而不是丢弃式的 `try_send`。Go 版对所有事件一视同仁地
     /// 满即丢，于是界面一卡顿，用户就会看到「有货」却收不到任何提醒。
     InStock { state: TargetState },
+    /// 一段到货记录结束了：Apple 明确答复没货，或者停止了查询。
+    ///
+    /// 宿主据此把记录写进到货历史，所以和到货提醒一样不允许丢。
+    SightingEnded(SightingRecord),
     /// 一轮查询已经开始。
     ///
     /// 这条事件专门给界面提供即时反馈：即使本轮库存与上一轮完全相同，用户也能
@@ -835,7 +916,11 @@ impl<F: Fetcher> Engine<F> {
 
     async fn handle_command(&mut self, cmd: Command) {
         match cmd {
-            Command::SetTargets(targets) => self.set_targets(targets),
+            Command::SetTargets(targets) => {
+                for record in self.set_targets(targets) {
+                    self.emit_eventually(Event::SightingEnded(record));
+                }
+            }
             Command::SetInterval(d) => {
                 if d > Duration::ZERO {
                     self.config.interval = d;
@@ -890,11 +975,29 @@ impl<F: Fetcher> Engine<F> {
         self.running = running;
         if running {
             self.cycle_number = 0;
+        } else {
+            // 停止查询后再看不到货什么时候没的，把还在进行的到货记录就此收尾。
+            let now = now_ms();
+            let ended: Vec<_> = self
+                .states
+                .values_mut()
+                .filter_map(|state| {
+                    let sighting = state.end_sighting(now, true)?;
+                    Some(SightingRecord {
+                        target: state.target.clone(),
+                        sighting,
+                    })
+                })
+                .collect();
+            for record in ended {
+                self.emit_eventually(Event::SightingEnded(record));
+            }
         }
         self.emit_droppable(Event::RunStateChanged { running });
     }
 
-    fn set_targets(&mut self, targets: Vec<Target>) {
+    /// 换成新的监控列表，返回被删掉的目标里还在进行的到货记录（已收尾）。
+    fn set_targets(&mut self, targets: Vec<Target>) -> Vec<SightingRecord> {
         let mut next = BTreeMap::new();
         for t in &targets {
             let key = t.key();
@@ -909,8 +1012,19 @@ impl<F: Fetcher> Engine<F> {
                 .unwrap_or_else(|| TargetState::new(t.clone()));
             next.insert(key, state);
         }
-        self.states = next;
+        let now = now_ms();
+        let ended = std::mem::replace(&mut self.states, next)
+            .into_values()
+            .filter_map(|mut state| {
+                let sighting = state.end_sighting(now, true)?;
+                Some(SightingRecord {
+                    target: state.target,
+                    sighting,
+                })
+            })
+            .collect();
         self.targets = targets;
+        ended
     }
 
     fn snapshot(&self) -> Vec<TargetState> {
@@ -1036,12 +1150,20 @@ impl<F: Fetcher> Engine<F> {
                     state.consecutive_failures = 0;
                 }
 
+                let ended = state.track_sighting(now);
                 let snapshot = state.clone();
                 if previous != snapshot.availability || previous_details != snapshot.pickup_details
                 {
                     self.emit_droppable(Event::StateChanged {
                         state: snapshot.clone(),
                     });
+                }
+                if let Some(sighting) = ended {
+                    self.emit_critical(Event::SightingEnded(SightingRecord {
+                        target: snapshot.target.clone(),
+                        sighting,
+                    }))
+                    .await;
                 }
                 if snapshot.availability.is_in_stock() {
                     // 用户要求每一轮只要确认有货就重新提醒。这样持续有货时也会按
@@ -1157,5 +1279,19 @@ impl<F: Fetcher> Engine<F> {
     /// 完全收不到任何提醒。
     async fn emit_critical(&self, event: Event) {
         let _ = self.events.send(event).await;
+    }
+
+    /// 投递不允许丢、但不能让引擎等的事件。
+    ///
+    /// 暂停监控、删掉监控时收尾的到货记录走这里：调用方往往正等着 stop() 返回，
+    /// 通道满了还让引擎原地等，就会和不再读事件的调用方互相卡住。通道有空位时
+    /// 立刻放进去，满了就交给一个后台任务慢慢送达，顺序可能晚于之后的事件。
+    fn emit_eventually(&self, event: Event) {
+        if let Err(mpsc::error::TrySendError::Full(event)) = self.events.try_send(event) {
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                let _ = events.send(event).await;
+            });
+        }
     }
 }

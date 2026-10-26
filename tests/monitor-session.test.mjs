@@ -2,15 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { describeSession, endSession, formatDuration, joinSession, recordCycle, startSession } from "../src/lib/monitorSession.ts";
 
-const inStock = { availability: { kind: "in_stock" } };
 const outOfStock = { availability: { kind: "out_of_stock" } };
+const started = { sighting: { sinceMs: 1, lastSeenMs: 1, rounds: 1 } };
+const continuing = { sighting: { sinceMs: 1, lastSeenMs: 2, rounds: 2 } };
+const finished = { sighting: { sinceMs: 1, lastSeenMs: 2, endedMs: 3, rounds: 2 } };
 
-test("开始监控后逐轮累计轮数、请求数和有货次数", () => {
+test("开始监控后逐轮累计轮数和请求数，同一段连续有货只算一次有货", () => {
   let session = startSession(1_000);
   session = recordCycle(session, { cycle: 1, requestCount: 3, snapshot: [outOfStock, outOfStock] });
-  session = recordCycle(session, { cycle: 2, requestCount: 2, snapshot: [inStock, outOfStock] });
-  session = recordCycle(session, { cycle: 3, requestCount: 0, snapshot: [inStock, inStock] });
-  assert.deepEqual(session, { startedAtMs: 1_000, endedAtMs: null, cycles: 3, requests: 5, hits: 3 });
+  session = recordCycle(session, { cycle: 2, requestCount: 2, snapshot: [started, outOfStock] });
+  session = recordCycle(session, { cycle: 3, requestCount: 0, snapshot: [continuing, started] });
+  session = recordCycle(session, { cycle: 4, requestCount: 1, snapshot: [finished, continuing] });
+  assert.deepEqual(session, { startedAtMs: 1_000, endedAtMs: null, cycles: 4, requests: 6, hits: 2 });
 });
 
 test("界面中途打开时轮数直接用引擎的编号，请求从打开后开始累计", () => {
