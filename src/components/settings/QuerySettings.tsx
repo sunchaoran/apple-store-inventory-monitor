@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { Info } from "lucide-react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { NetworkSettings } from "@/components/settings/NetworkSettings";
 import { Button } from "@/components/ui/button";
@@ -7,6 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { UiState } from "@/lib/store";
 import { loadDeliveryLocalities, saveSettings, setIntervalSeconds } from "@/lib/store";
 import type { DeliveryLocalities, DeliveryRegion } from "@/lib/types";
@@ -18,6 +20,26 @@ const EMPTY_DELIVERY_LOCALITIES: DeliveryLocalities = {
 };
 
 const EMPTY_REGION: DeliveryRegion = { state: "", city: "", district: "" };
+
+/** 说明收进一个小图标，悬停或用键盘聚焦时才显示，设置页不必铺满大段文字。 */
+function InfoTip({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className="size-5 rounded-full text-muted-foreground hover:text-foreground"
+          aria-label={label}
+        >
+          <Info className="size-3.5" aria-hidden="true" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-72 leading-5">{children}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 function IntervalField({ intervalSeconds, alignedOnly }: { intervalSeconds: number; alignedOnly: boolean }) {
   const [draft, setDraft] = useState<number | null>(null);
@@ -67,7 +89,12 @@ function AlignedChecksField({ minutes, alignedOnly }: { minutes: number[]; align
   }
   return (
     <fieldset className="field-group">
-      <legend className="control-label">定点查询</legend>
+      <legend className="control-label">
+        定点查询
+        <InfoTip label="定点查询说明">
+          勾选的时刻一到就立即查一轮，不等查询间隔走完，例如勾「整点」和「15 分」，就会在 12:00、12:15、13:00、13:15 各查一次。全部不勾即关闭。保护冷却中不为此多查。
+        </InfoTip>
+      </legend>
       <div className="grid grid-cols-4 gap-x-3 gap-y-2">
         {MARK_MINUTES.map((minute) => (
           <label key={minute} className="flex cursor-pointer items-center gap-2 text-[13px] tabular-nums">
@@ -81,7 +108,13 @@ function AlignedChecksField({ minutes, alignedOnly }: { minutes: number[]; align
         ))}
       </div>
       <div className="setting-row">
-        <Label htmlFor="aligned-only" className="text-sm font-normal">只做定点查询</Label>
+        {/* 图标放在 Label 外面：Label 里的按钮被点到时会顺带切换开关。 */}
+        <div className="flex items-center gap-1.5">
+          <Label htmlFor="aligned-only" className="text-sm font-normal">只做定点查询</Label>
+          <InfoTip label="只做定点查询说明">
+            只在勾选的时刻查询，不再按查询间隔，例如只勾「整点」就每小时查一次。开始监控时会先查一轮，之后新加的监控也等到下一个勾选的时刻再查；保护冷却中时，等冷却结束后的第一个勾选时刻再查。至少勾选一个时刻才能打开。
+          </InfoTip>
+        </div>
         <Switch
           id="aligned-only"
           checked={alignedOnly}
@@ -89,13 +122,6 @@ function AlignedChecksField({ minutes, alignedOnly }: { minutes: number[]; align
           onCheckedChange={(value) => void saveSettings({ alignedOnly: value })}
         />
       </div>
-      <p className="hint">
-        {minutes.length === 0
-          ? "全部不勾即关闭定点查询，照常按查询间隔查询；「只做定点查询」要勾选至少一个时刻才生效。"
-          : alignedOnly
-            ? "只在勾选的时刻查询，不再按查询间隔，例如只勾「整点」就每小时查一次；开始监控时会先查一轮，之后新加的监控也等到下一个勾选的时刻再查。Apple 正在拒绝查询（保护冷却中）时，等冷却结束后的第一个勾选时刻再查。"
-            : "勾选的时刻一到就立即查一轮，不等查询间隔走完，之后照常按间隔查询；例如勾「整点」和「15 分」，就会在 12:00、12:15、13:00、13:15 各查一次。全部不勾即关闭。Apple 正在拒绝查询（保护冷却中）时不为此多查。"}
-      </p>
     </fieldset>
   );
 }
@@ -190,8 +216,26 @@ function DeliveryRegionField({ ready, saved, running }: { ready: boolean; saved:
   return (
     <div className="field-group">
       <div className="flex items-center justify-between gap-3">
-        <Label className="control-label">中国大陆送货地区</Label>
-        <span className="text-xs text-muted-foreground" role="status" aria-live="polite">{statusText}</span>
+        <div className="flex items-center gap-1.5">
+          <Label className="control-label">中国大陆送货地区</Label>
+          <InfoTip label="送货地区说明">
+            用于查询 Apple 预计送货日期，只对中国大陆的监控生效，与添加监控时选的地区无关。选完「区」后自动保存，
+            {running ? "下轮会更新送货日期。" : "开始监控后会查询送货日期。"}
+          </InfoTip>
+        </div>
+        <div className="flex items-center gap-1">
+          <span className="text-xs text-muted-foreground" role="status" aria-live="polite">{statusText}</span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="text-muted-foreground"
+            disabled={saving || (!saved && !dirty)}
+            onClick={() => void persist(null)}
+          >
+            清除
+          </Button>
+        </div>
       </div>
       <div className="grid grid-cols-3 gap-2">
         <Select
@@ -252,22 +296,6 @@ function DeliveryRegionField({ ready, saved, running }: { ready: boolean; saved:
             ))}
           </SelectContent>
         </Select>
-      </div>
-      <div className="flex items-start justify-between gap-2">
-        <p className="hint">
-          用于查询 Apple 预计送货日期，只对中国大陆的监控生效，与添加监控时选的地区无关；选完「区」后自动保存。
-          {running ? "下轮会更新送货日期。" : "开始监控后会查询送货日期。"}
-        </p>
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          className="shrink-0 text-muted-foreground"
-          disabled={saving || (!saved && !dirty)}
-          onClick={() => void persist(null)}
-        >
-          清除
-        </Button>
       </div>
       {error ? <p role="alert" className="text-xs leading-5 text-destructive">{error}</p> : null}
     </div>
