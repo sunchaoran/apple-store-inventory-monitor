@@ -30,7 +30,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use crate::apple::{ApiError, CycleStats, Fetcher, ScheduleHint};
+use crate::apple::{ApiError, BlockedRoute, CycleStats, Fetcher, ScheduleHint};
+use crate::config::AlignedChecks;
 use crate::model::{
     Availability, DeliveryRegion, PickupDetails, Target, TargetKey, UnknownReason, region_by_locale,
 };
@@ -117,9 +118,16 @@ pub enum Event {
         next_check_in_secs: u64,
         /// 当前目标地区中是否仍有 Apple 查询保护冷却。
         cooling: bool,
+        /// 下一次是定点查询：只做定点查询、定点时刻比查询间隔先到，或者定点时刻刚好
+        /// 落在本轮里要立即再查。
+        #[serde(rename = "alignedCheck")]
+        aligned_check: bool,
         /// 本轮使用的出口线路说明；跟随系统代理时省略。
         #[serde(skip_serializing_if = "Option::is_none")]
         route: Option<String>,
+        /// 仍被 Apple 拒绝的出口和起始时间；没有出口被拒时省略。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        blocked: Option<BlockedRoute>,
         /// 本轮是否所有目标都拿到了明确答复。
         ///
         /// 界面需要一个明确的「恢复」信号才能收起故障告警。用「所有行都没有
@@ -149,6 +157,10 @@ pub struct WatcherConfig {
     pub interval: Duration,
     /// 间隔抖动比例（0 到 1）。固定周期本身就是机器人特征。
     pub jitter: f64,
+    /// 定点查询的时刻。默认关闭，由宿主按用户设置打开。
+    pub aligned_checks: AlignedChecks,
+    /// 只做定点查询：不按查询间隔，只在定点时刻查询。没有定点时刻时不生效。
+    pub aligned_only: bool,
     /// 同一轮内并发查询的门店数上限。
     pub concurrency: usize,
     /// 事件通道容量。
@@ -161,6 +173,8 @@ impl Default for WatcherConfig {
         Self {
             interval: Duration::from_secs(30),
             jitter: 0.0,
+            aligned_checks: AlignedChecks::off(),
+            aligned_only: false,
             concurrency: 4,
             event_buffer: 256,
             delivery_region: None,
@@ -171,10 +185,12 @@ impl Default for WatcherConfig {
 enum Command {
     SetTargets(Vec<Target>),
     SetInterval(Duration),
+    SetAlignedChecks(AlignedChecks, bool),
     SetDeliveryRegion(Option<DeliveryRegion>),
     Start(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
     RetryNow(oneshot::Sender<bool>),
+    QueryNow(oneshot::Sender<bool>),
     Snapshot(oneshot::Sender<Vec<TargetState>>),
     IsRunning(oneshot::Sender<bool>),
 }
@@ -228,6 +244,14 @@ impl Watcher {
         let _ = self.cmd.send(Command::SetInterval(interval)).await;
     }
 
+    /// 调整定点查询的时刻，以及是否只做定点查询。
+    pub async fn set_aligned_checks(&self, aligned: AlignedChecks, only: bool) {
+        let _ = self
+            .cmd
+            .send(Command::SetAlignedChecks(aligned, only))
+            .await;
+    }
+
     pub async fn set_delivery_region(&self, region: Option<DeliveryRegion>) {
         let _ = self.cmd.send(Command::SetDeliveryRegion(region)).await;
     }
@@ -252,11 +276,21 @@ impl Watcher {
         }
     }
 
-    /// 用户主动要求立即查询。运行中返回 `true`，并唤醒当前轮次等待；暂停时
-    /// 返回 `false`，不会擅自启动监控。
+    /// 用户主动要求立即重试：先清除查询器的保护冷却，再马上查询。运行中返回
+    /// `true`，并唤醒当前轮次等待；暂停时返回 `false`，不会擅自启动监控。
     pub async fn retry_now(&self) -> bool {
         let (tx, rx) = oneshot::channel();
         if self.cmd.send(Command::RetryNow(tx)).await.is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
+    /// 用户主动要求马上查一轮，不动保护冷却。只做定点查询时用来不等下一个定点时刻。
+    /// 运行中返回 `true` 并唤醒当前等待；暂停时返回 `false`，不会擅自启动监控。
+    pub async fn query_now(&self) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd.send(Command::QueryNow(tx)).await.is_err() {
             return false;
         }
         rx.await.unwrap_or(false)
@@ -591,6 +625,22 @@ struct Engine<F: Fetcher> {
     running: bool,
     /// 当前监控会话已经开始的轮次数。暂停后重新开始会从 1 重新计数。
     cycle_number: u64,
+    /// 保护冷却结束的时刻。只做定点查询时改了设置要重新算等待，不能早于它。
+    cooldown_until: Option<tokio::time::Instant>,
+}
+
+/// 等下一轮期间收到命令后怎么办。
+enum Wake {
+    /// 只读查询或重复的开始，照原定时间继续等。
+    Never,
+    /// 立即重试、立即查询、暂停：马上处理。
+    Now,
+    /// 改了监控列表、查询间隔或地区：普通模式下按新设置马上查一轮；只做定点查询时
+    /// 照原定的定点时刻继续等，不额外查询。
+    Settings,
+    /// 改了定点时刻或「只做定点查询」：只做定点查询时按新的时刻重新算等待，普通模式下
+    /// 同 `Settings`。
+    Marks,
 }
 
 impl<F: Fetcher> Engine<F> {
@@ -603,7 +653,13 @@ impl<F: Fetcher> Engine<F> {
             states: BTreeMap::new(),
             running: false,
             cycle_number: 0,
+            cooldown_until: None,
         }
+    }
+
+    /// 是否只在定点时刻查询。没有勾选任何时刻时仍按普通间隔，免得永远不查。
+    fn aligned_only(&self) -> bool {
+        self.config.aligned_only && !self.config.aligned_checks.minutes().is_empty()
     }
 
     async fn run(mut self, mut cmd_rx: mpsc::Receiver<Command>) {
@@ -719,12 +775,60 @@ impl<F: Fetcher> Engine<F> {
                 continue;
             }
 
-            tokio::select! {
-                () = tokio::time::sleep(delay) => {}
-                maybe = cmd_rx.recv() => match maybe {
-                    Some(cmd) => self.handle_command(cmd).await,
-                    None => return,
-                },
+            let mut deadline = tokio::time::Instant::now() + delay;
+            loop {
+                tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => break,
+                    maybe = cmd_rx.recv() => {
+                        let Some(cmd) = maybe else {
+                            return;
+                        };
+                        let wake = match &cmd {
+                            Command::Snapshot(_) | Command::IsRunning(_) | Command::Start(_) => {
+                                Wake::Never
+                            }
+                            Command::RetryNow(_) | Command::QueryNow(_) | Command::Stop(_) => {
+                                Wake::Now
+                            }
+                            // 每次保存设置都会带上定点设置，没变就不算改动。
+                            Command::SetAlignedChecks(aligned, only)
+                                if *aligned == self.config.aligned_checks
+                                    && *only == self.config.aligned_only =>
+                            {
+                                Wake::Never
+                            }
+                            Command::SetAlignedChecks(..) => Wake::Marks,
+                            Command::SetTargets(_)
+                            | Command::SetInterval(_)
+                            | Command::SetDeliveryRegion(_) => Wake::Settings,
+                        };
+                        self.handle_command(cmd).await;
+                        if !self.running {
+                            break;
+                        }
+                        match wake {
+                            Wake::Never => {}
+                            Wake::Now => break,
+                            Wake::Settings | Wake::Marks if !self.aligned_only() => break,
+                            Wake::Settings => {}
+                            Wake::Marks => {
+                                let now = tokio::time::Instant::now();
+                                // 原定的时刻已经到了就照常查，别让同时到的改动把这一次跳过。
+                                if now >= deadline {
+                                    break;
+                                }
+                                let cooldown = self
+                                    .cooldown_until
+                                    .map_or(Duration::ZERO, |until| until.saturating_duration_since(now));
+                                deadline = now
+                                    + self
+                                        .config
+                                        .aligned_checks
+                                        .first_mark_from(chrono::Local::now().time(), cooldown);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -736,6 +840,10 @@ impl<F: Fetcher> Engine<F> {
                 if d > Duration::ZERO {
                     self.config.interval = d;
                 }
+            }
+            Command::SetAlignedChecks(aligned, only) => {
+                self.config.aligned_checks = aligned;
+                self.config.aligned_only = only;
             }
             Command::SetDeliveryRegion(region) => {
                 if region != self.config.delivery_region {
@@ -762,6 +870,9 @@ impl<F: Fetcher> Engine<F> {
                     self.client.retry_now().await;
                 }
                 let _ = reply.send(accepted);
+            }
+            Command::QueryNow(reply) => {
+                let _ = reply.send(self.running);
             }
             Command::Snapshot(reply) => {
                 let _ = reply.send(self.snapshot());
@@ -969,6 +1080,30 @@ impl<F: Fetcher> Engine<F> {
             }
         }
 
+        // 定点时刻先于普通间隔到来时提前到那一刻，只做定点查询时一律等到下一个定点
+        // 时刻；保护冷却仍然优先，被拒期间不为定点时刻多发请求。只做定点查询时冷却
+        // 结束也不马上查，等到那之后的第一个定点时刻。
+        let now = chrono::Local::now().time();
+        let only = self.aligned_only();
+        let (normal_delay, aligned) = self.config.aligned_checks.next_delay(
+            self.next_delay(),
+            Duration::from_millis(elapsed_ms),
+            now,
+            only,
+        );
+        let delay = if only && schedule_hint.delay > normal_delay {
+            self.config
+                .aligned_checks
+                .first_mark_from(now, schedule_hint.delay)
+        } else {
+            normal_delay.max(schedule_hint.delay)
+        };
+        self.cooldown_until = (!schedule_hint.delay.is_zero())
+            .then(|| tokio::time::Instant::now() + schedule_hint.delay);
+        let next_check_in_secs = delay
+            .as_secs()
+            .saturating_add(u64::from(delay.subsec_nanos() > 0));
+
         // 这条不能丢。emit_droppable 的理由是「信息都能从 CycleComplete 带的快照里
         // 重新拿到」—— 那对 StateChanged/Trouble 成立，对 CycleComplete 自己就是循环
         // 论证：兜底的那张网不能自己也是可丢的。
@@ -978,11 +1113,6 @@ impl<F: Fetcher> Engine<F> {
         // 目标数超过通道容量时，排在最后的 CycleComplete 必然被丢，界面就会一直
         // 停在上一轮的取值上 —— 而那很可能正是「无货」。实测 260 个目标时连续
         // 18 轮一条都没送达。
-        let normal_delay = self.next_delay();
-        let delay = normal_delay.max(schedule_hint.delay);
-        let next_check_in_secs = delay
-            .as_secs()
-            .saturating_add(u64::from(delay.subsec_nanos() > 0));
         self.emit_critical(Event::CycleComplete {
             cycle,
             elapsed_ms,
@@ -990,7 +1120,9 @@ impl<F: Fetcher> Engine<F> {
             reused_response_count: stats.reused_response_count,
             next_check_in_secs,
             cooling: schedule_hint.cooling,
+            aligned_check: aligned && (only || delay == normal_delay),
             route: stats.route,
+            blocked: stats.blocked,
             healthy: problems == 0 && ok > 0,
             snapshot: self.snapshot(),
         })

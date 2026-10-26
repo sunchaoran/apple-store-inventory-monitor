@@ -95,6 +95,7 @@ dependencies = [
 name = "apw-core"
 version = "1.0.25"
 dependencies = [
+ "chrono",
  "dirs",
  "dom_query",
  "rand 0.9.5",

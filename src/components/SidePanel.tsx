@@ -66,7 +66,7 @@ export function SidePanel({
           <QuerySettings ui={ui} />
         </TabsContent>
         <TabsContent forceMount value="checkout" className={settingsPage}>
-          <CheckoutSettings checkout={checkout} targets={ui.settings.targets} />
+          <CheckoutSettings checkout={checkout} targets={ui.settings.targets} signIn={ui.checkoutSignIn} />
         </TabsContent>
       </Tabs>
     </aside>

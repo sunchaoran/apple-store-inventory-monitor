@@ -9,6 +9,7 @@
 //! `switch` 的穷尽性检查，Rust 这边加一个状态、前端漏处理就编译不过。这是刻意
 //! 设计的，不是巧合，所以必须钉住。
 
+use apw_core::apple::BlockedRoute;
 use apw_core::config::OpenOnHit;
 use apw_core::model::{Availability, Category, Product, Store, Target, UnknownReason};
 use apw_core::watcher::{Event, TroubleAdvice};
@@ -233,7 +234,13 @@ fn 轮询事件携带前端可用的轮次与耗时() {
         reused_response_count: 2,
         next_check_in_secs: 60,
         cooling: true,
+        aligned_check: false,
         route: Some("Clash 节点 香港01".into()),
+        blocked: Some(BlockedRoute {
+            route: "系统代理 127.0.0.1:6152".into(),
+            since_ms: 1_700_000_000_000,
+            rejections: 3,
+        }),
         healthy: true,
         snapshot: Vec::new(),
     });
@@ -245,7 +252,34 @@ fn 轮询事件携带前端可用的轮次与耗时() {
     assert_eq!(completed.get("nextCheckInSecs"), Some(&json!(60)));
     assert_eq!(completed.get("route"), Some(&json!("Clash 节点 香港01")));
     assert_eq!(completed.get("cooling"), Some(&json!(true)));
+    assert_eq!(
+        completed.get("blocked"),
+        Some(&json!({
+            "route": "系统代理 127.0.0.1:6152",
+            "sinceMs": 1_700_000_000_000u64,
+            "rejections": 3
+        }))
+    );
     assert!(completed.get("elapsed_ms").is_none());
+
+    // 没有出口被拒时整个字段省略，前端据此收起说明。
+    let healthy = to_value(&Event::CycleComplete {
+        cycle: 3,
+        elapsed_ms: 900,
+        request_count: 1,
+        reused_response_count: 0,
+        next_check_in_secs: 12,
+        cooling: false,
+        aligned_check: true,
+        route: None,
+        blocked: None,
+        healthy: true,
+        snapshot: Vec::new(),
+    });
+    assert!(healthy.get("blocked").is_none());
+    assert!(healthy.get("route").is_none());
+    assert_eq!(healthy.get("alignedCheck"), Some(&json!(true)));
+    assert!(healthy.get("aligned_check").is_none());
 }
 
 #[test]

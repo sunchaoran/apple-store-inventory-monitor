@@ -9,13 +9,13 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use apw_core::config::{
-    BarkOptions, CheckoutPayment, CheckoutSettings, ClashSettings, ConfigError,
+    AlignedChecks, BarkOptions, CheckoutPayment, CheckoutSettings, ClashSettings, ConfigError,
     DEFAULT_INTERVAL_SECONDS, MAX_SETTINGS_BYTES, NetworkMode, NetworkSettings, OpenOnHit,
     Settings, SettingsStore,
 };
@@ -95,6 +95,8 @@ fn 样例设置() -> Settings {
         targets: vec![目标("R683", "MG724CH/A"), 目标("R448", "MG0A4CH/A")],
         delivery_region: None,
         interval_seconds: 45,
+        aligned_checks: AlignedChecks::new([0]),
+        aligned_only: true,
         bark_url: "https://api.day.app/xxxx".into(),
         product_bark_urls: [("MG724CH/A".into(), "https://api.day.app/friend".into())]
             .into_iter()
@@ -595,6 +597,8 @@ fn 设置的线上格式是小驼峰() {
         "targets",
         "deliveryRegion",
         "intervalSeconds",
+        "alignedChecks",
+        "alignedOnly",
         "barkUrl",
         "productBarkUrls",
         "barkOptions",
@@ -608,8 +612,10 @@ fn 设置的线上格式是小驼峰() {
     }
     assert!(!obj.contains_key("interval_seconds"), "不该有蛇形字段");
     assert_eq!(obj.get("openOnHit"), Some(&serde_json::json!("product")));
+    assert_eq!(obj.get("alignedChecks"), Some(&serde_json::json!([0])));
+    assert_eq!(obj.get("alignedOnly"), Some(&serde_json::json!(true)));
     assert!(!obj.contains_key("openBagOnHit"));
-    assert_eq!(obj.len(), 12);
+    assert_eq!(obj.len(), 14);
     assert_eq!(
         obj.get("network"),
         Some(&serde_json::json!({
@@ -927,4 +933,174 @@ fn 其他地区的监控项不会触发自动结账() {
     settings.normalize();
     assert_eq!(settings.checkout_product(), None);
     assert!(!settings.checkout.enabled);
+}
+
+fn 时刻(hour: u32, minute: u32, second: u32, milli: u32) -> chrono::NaiveTime {
+    chrono::NaiveTime::from_hms_milli_opt(hour, minute, second, milli).expect("时刻不合法")
+}
+
+#[test]
+fn 勾选的时刻先于查询间隔到来时提前到那一刻查询() {
+    let normal = Duration::from_secs(30);
+    let round = Duration::from_secs(3);
+    let half_hourly = AlignedChecks::new([0, 30]);
+    // 11:59:45.5 结束一轮：按间隔要到 12:00:15.5，整点先到。
+    assert_eq!(
+        half_hourly.next_delay(normal, round, 时刻(11, 59, 45, 500), false),
+        (Duration::from_millis(14_500), true)
+    );
+    // 6:29:50 结束一轮：半点先到；只勾整点时照常按间隔。
+    assert_eq!(
+        half_hourly.next_delay(normal, round, 时刻(6, 29, 50, 0), false),
+        (Duration::from_secs(10), true)
+    );
+    assert_eq!(
+        AlignedChecks::new([0]).next_delay(normal, round, 时刻(6, 29, 50, 0), false),
+        (normal, false)
+    );
+    // 勾了 5、10、15 分：12:04:52 结束的一轮等到 12:05，12:09:50 的等到 12:10。
+    let marks = AlignedChecks::new([0, 5, 10, 15]);
+    assert_eq!(
+        marks.next_delay(normal, round, 时刻(12, 4, 52, 0), false),
+        (Duration::from_secs(8), true)
+    );
+    assert_eq!(
+        marks.next_delay(normal, round, 时刻(12, 9, 50, 0), false),
+        (Duration::from_secs(10), true)
+    );
+    // 15 分之后下一个勾选的是下一小时的整点，间隔先到时不动。
+    assert_eq!(
+        marks.next_delay(normal, round, 时刻(12, 20, 0, 0), false),
+        (normal, false)
+    );
+    assert_eq!(
+        AlignedChecks::off().next_delay(normal, round, 时刻(11, 59, 59, 0), false),
+        (normal, false)
+    );
+    // 间隔很长时，整点前五分钟结束的一轮也会等到整点。
+    assert_eq!(
+        AlignedChecks::new([0]).next_delay(
+            Duration::from_secs(600),
+            round,
+            时刻(11, 55, 0, 0),
+            false
+        ),
+        (Duration::from_secs(300), true)
+    );
+}
+
+#[test]
+fn 勾选的时刻落在这一轮查询过程中时立即再查一轮() {
+    let normal = Duration::from_secs(30);
+    let marks = AlignedChecks::new([0, 15]);
+    // 12:14:58 开始、12:15:02 结束的一轮，请求多半在 12:15 之前发出，马上再查。
+    assert_eq!(
+        marks.next_delay(normal, Duration::from_secs(4), 时刻(12, 15, 2, 0), false),
+        (Duration::ZERO, true)
+    );
+    // 由 12:00 唤醒的那一轮（12:00:00 开始、12:00:03 结束）不算错过，下一次照常按间隔。
+    assert_eq!(
+        marks.next_delay(
+            normal,
+            Duration::from_millis(2_990),
+            时刻(12, 0, 3, 0),
+            false
+        ),
+        (normal, false)
+    );
+}
+
+#[test]
+fn 只做定点查询时不看查询间隔一律等到下一个勾选的时刻() {
+    let normal = Duration::from_secs(30);
+    let round = Duration::from_secs(3);
+    // 12:10 结束一轮：只勾整点时等到 13:00，不按 30 秒的间隔。
+    assert_eq!(
+        AlignedChecks::new([0]).next_delay(normal, round, 时刻(12, 10, 0, 0), true),
+        (Duration::from_secs(50 * 60), true)
+    );
+    // 勾选的时刻落在这一轮里照样立即再查；由勾选的时刻唤醒的那一轮不算错过，等下一个。
+    let marks = AlignedChecks::new([0, 15]);
+    assert_eq!(
+        marks.next_delay(normal, Duration::from_secs(4), 时刻(12, 15, 2, 0), true),
+        (Duration::ZERO, true)
+    );
+    assert_eq!(
+        marks.next_delay(
+            normal,
+            Duration::from_millis(2_990),
+            时刻(12, 0, 3, 0),
+            true
+        ),
+        (Duration::from_secs(15 * 60 - 3), true)
+    );
+    // 一个时刻都没勾时不生效，照常按间隔，免得再也不查。
+    assert_eq!(
+        AlignedChecks::off().next_delay(normal, round, 时刻(12, 10, 0, 0), true),
+        (normal, false)
+    );
+}
+
+#[test]
+fn 冷却结束后等到不早于它的第一个勾选的时刻() {
+    let marks = AlignedChecks::new([0, 30]);
+    // 12:20 起冷却 15 分钟，到 12:35 结束，下一个勾选的是 13:00。
+    assert_eq!(
+        marks.first_mark_from(时刻(12, 20, 0, 0), Duration::from_secs(15 * 60)),
+        Duration::from_secs(40 * 60)
+    );
+    // 冷却刚好在勾选的时刻结束，就在那一刻查。
+    assert_eq!(
+        AlignedChecks::new([0, 5, 10]).first_mark_from(时刻(12, 3, 0, 0), Duration::from_secs(120)),
+        Duration::from_secs(120)
+    );
+    // 跨过整点：12:50 起冷却 20 分钟到 13:10，只勾 5 分时等到 14:05。
+    assert_eq!(
+        AlignedChecks::new([5]).first_mark_from(时刻(12, 50, 0, 0), Duration::from_secs(20 * 60)),
+        Duration::from_secs(75 * 60)
+    );
+    // 没有冷却时就是下一个勾选的时刻；一个都没勾时只等冷却。
+    assert_eq!(
+        marks.first_mark_from(时刻(12, 29, 30, 500), Duration::ZERO),
+        Duration::from_millis(29_500)
+    );
+    assert_eq!(
+        AlignedChecks::off().first_mark_from(时刻(12, 0, 0, 0), Duration::from_secs(420)),
+        Duration::from_secs(420)
+    );
+}
+
+#[test]
+fn 定点时刻按分钟去重排序且兼容旧版的文字取值() {
+    assert_eq!(AlignedChecks::new([30, 0, 30, 75]).minutes(), [0, 30]);
+    let settings: Settings = serde_json::from_str(r#"{"locale":"zh_CN"}"#).expect("解析失败");
+    assert_eq!(
+        settings.aligned_checks,
+        AlignedChecks::new([0, 30]),
+        "默认整点和半点"
+    );
+    assert!(!settings.aligned_only, "默认仍按查询间隔查询");
+    for (legacy, minutes) in [
+        ("half_hourly", vec![0, 30]),
+        ("hourly", vec![0]),
+        ("off", vec![]),
+    ] {
+        let settings: Settings =
+            serde_json::from_str(&format!(r#"{{"alignedChecks":"{legacy}"}}"#))
+                .expect("旧版取值应能读取");
+        assert_eq!(
+            settings.aligned_checks.minutes(),
+            minutes.as_slice(),
+            "{legacy}"
+        );
+    }
+    let settings: Settings =
+        serde_json::from_str(r#"{"alignedChecks":[15,5,-1,60,10]}"#).expect("解析失败");
+    assert_eq!(settings.aligned_checks.minutes(), [5, 10, 15]);
+    let saved = serde_json::to_value(Settings {
+        aligned_checks: AlignedChecks::new([0, 15]),
+        ..Default::default()
+    })
+    .expect("序列化失败");
+    assert_eq!(saved["alignedChecks"], serde_json::json!([0, 15]));
 }

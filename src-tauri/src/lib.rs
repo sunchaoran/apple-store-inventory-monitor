@@ -9,6 +9,7 @@
 //! 系统节流甚至挂起，把「及时提醒」挂在一个会被挂起的执行环境上是不能接受的。
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,10 +29,12 @@ mod checkout;
 mod checkout_login;
 mod chromium_fetcher;
 mod clash;
+mod exit_backoff;
 mod route_pool;
+mod system_proxy;
 #[cfg(windows)]
 mod windows_chromium;
-use checkout::{CheckoutOutcome, CheckoutPlan, CheckoutRunner};
+use checkout::{CheckoutOutcome, CheckoutPlan, CheckoutRunner, SignInOutcome, Warmup};
 use chromium_fetcher::AppleChromiumFetcher;
 
 /// 前端事件通道名。前端用 `listen("watcher://event", ...)` 订阅。
@@ -40,6 +43,11 @@ const EVENT_CHANNEL: &str = "watcher://event";
 const NOTICE_CHANNEL: &str = "watcher://notice";
 /// 后端自己改了设置（例如结账完成后关闭自动结账）时，把新设置推给界面。
 const SETTINGS_CHANNEL: &str = "watcher://settings";
+/// 下单浏览器里 Apple 账户的登录检查结果。
+const CHECKOUT_SIGN_IN_CHANNEL: &str = "checkout://sign-in";
+/// 监控期间多久确认一次下单浏览器里的 Apple 账户还在登录。每次只打开一次账户页
+/// 再回到购物袋，频率低到不会给 Apple 添负担，又能在到货前留出重新登录的时间。
+const CHECKOUT_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// 退出时等待浏览器收尾的上限。正在进行的查询或结账可能占着会话不放，
 /// 不能让退出一直卡住；超时后残留的进程由下次启动回收。
 const EXIT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -314,6 +322,18 @@ struct AppState {
     settings: RwLock<Settings>,
     /// 为 `None` 表示配置不可持久化（目录不可写，或上次读取失败已放弃写盘）。
     store: Option<SettingsStore>,
+    /// 定时确认下单浏览器登录状态的任务是否在跑，保证只有一个。
+    checkout_keeper: AtomicBool,
+    /// 上次确认到的登录状态：0 未知、1 已登录、2 未登录。只在变化时提醒。
+    checkout_signed_in: AtomicU8,
+}
+
+/// 下单浏览器里 Apple 账户的登录检查结果，推给界面。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckoutSignIn {
+    signed_in: bool,
+    checked_at_ms: u64,
 }
 
 impl AppState {
@@ -694,9 +714,11 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 async fn save_settings(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
     settings: Settings,
 ) -> Result<Settings, String> {
+    let checkout_was_enabled = state.settings_snapshot().checkout.enabled;
     let mut next = settings;
     next.normalize();
     state.catalog.hydrate_watch_targets(&mut next.targets);
@@ -705,6 +727,12 @@ async fn save_settings(
 
     // 先成功落盘，再把同一份设置同步给引擎，避免三者分叉。
     state.put_settings(next.clone())?;
+    // 定点设置先送：刚打开「只做定点查询」时，引擎要先知道，后面的监控列表才不会
+    // 按普通模式立刻多查一轮。
+    state
+        .watcher
+        .set_aligned_checks(next.aligned_checks.clone(), next.aligned_only)
+        .await;
     state.watcher.set_targets(next.targets.clone()).await;
     state.watcher.set_interval(next.interval()).await;
     state
@@ -712,6 +740,10 @@ async fn save_settings(
         .set_delivery_region(next.delivery_region.clone())
         .await;
     state.fetcher.set_network(next.network.clone()).await;
+    if next.checkout.enabled && !checkout_was_enabled {
+        // 监控中才打开自动结账：同样提前把下单浏览器准备好。
+        warm_checkout(&app);
+    }
 
     Ok(next)
 }
@@ -829,6 +861,12 @@ async fn stop_watching(state: tauri::State<'_, AppState>) -> Result<(), String> 
 #[tauri::command]
 async fn retry_watching_now(state: tauri::State<'_, AppState>) -> Result<bool, String> {
     Ok(state.watcher.retry_now().await)
+}
+
+/// 只做定点查询时不等下一个勾选的时刻，马上查一轮；不清除保护冷却。
+#[tauri::command]
+async fn query_now(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.watcher.query_now().await)
 }
 
 #[tauri::command]
@@ -1111,6 +1149,152 @@ async fn open_checkout_browser(state: tauri::State<'_, AppState>) -> Result<(), 
     state.checkout.open().await.map_err(|e| e.to_string())
 }
 
+/// 在下单浏览器里登录 Apple 账户：保存了登录信息时自动填写并提交，否则打开登录页
+/// 交给用户。返回一句写进活动日志的说明。
+#[tauri::command]
+async fn sign_in_checkout_browser(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<String, String> {
+    match state.checkout.sign_in().await.map_err(|e| e.to_string())? {
+        SignInOutcome::SignedIn => {
+            report_sign_in(&app, true);
+            Ok("下单浏览器：已用保存的账户登录 Apple，并回到了购物袋。".into())
+        }
+        SignInOutcome::AlreadySignedIn => {
+            report_sign_in(&app, true);
+            Ok("下单浏览器：Apple 账户已经是登录状态。".into())
+        }
+        SignInOutcome::NeedsUser(reason) => Ok(format!(
+            "下单浏览器：{reason}。请在窗口里完成登录，完成后点「重新检查」。"
+        )),
+    }
+}
+
+/// 立即确认下单浏览器里的 Apple 账户是否已登录。浏览器没开着时不替用户打开。
+#[tauri::command]
+async fn check_checkout_sign_in(
+    app: AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let result = state.checkout.warm_up(false).await;
+    report_warmup(&app, &result);
+    match result {
+        Ok(Warmup::Ready {
+            signed_in: Some(signed_in),
+            ..
+        }) => Ok(signed_in),
+        Ok(Warmup::Ready {
+            signed_in: None, ..
+        }) => Err("没能从账户页确认登录状态，请稍后再试".into()),
+        Ok(Warmup::Closed) => Err("下单浏览器没有开着，请先打开登录页或下单浏览器".into()),
+        Ok(Warmup::Skipped) => Err(
+            "下单浏览器正在使用，或停在购物袋和账户页以外的页面（例如还没登录完），稍后再检查"
+                .into(),
+        ),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// 监控期间让下单浏览器保持就绪。
+///
+/// 开始监控、监控中打开自动结账、自动结账失败后调用：在后台打开下单浏览器并停在
+/// 购物袋，到货时直接复用，省掉冷启动和首次加载；再确保有一个任务定时确认 Apple
+/// 账户还在登录，掉登录时提前提醒，而不是到货时才卡在登录或双重认证上。
+fn warm_checkout(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Some(state) = app.try_state::<AppState>() else {
+            return;
+        };
+        if !state.settings_snapshot().checkout.enabled || !state.watcher.is_running().await {
+            return;
+        }
+        // 新开的浏览器窗口会抢到前台。用户刚在拾果里点了开始监控，就把焦点还回来。
+        let window = app.get_webview_window("main");
+        let focused = window
+            .as_ref()
+            .is_some_and(|window| window.is_focused().unwrap_or(false));
+        let result = state.checkout.warm_up(true).await;
+        if focused
+            && matches!(result, Ok(Warmup::Ready { opened: true, .. }))
+            && let Some(window) = &window
+        {
+            let _ = window.set_focus();
+        }
+        report_warmup(&app, &result);
+
+        if state.checkout_keeper.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        loop {
+            tokio::time::sleep(CHECKOUT_CHECK_INTERVAL).await;
+            if !state.watcher.is_running().await {
+                break;
+            }
+            if state.settings_snapshot().checkout.enabled {
+                report_warmup(&app, &state.checkout.warm_up(false).await);
+            }
+        }
+        state.checkout_keeper.store(false, Ordering::Release);
+    });
+}
+
+/// 把预热结果告诉用户。新开了窗口、登录状态有变化或预热失败时才说话，
+/// 定时检查一切如常时不刷屏。
+fn report_warmup(app: &AppHandle, result: &Result<Warmup, checkout::CheckoutError>) {
+    let (opened, signed_in) = match result {
+        Ok(Warmup::Ready { opened, signed_in }) => (*opened, *signed_in),
+        Ok(Warmup::Skipped | Warmup::Closed) => return,
+        Err(error) => {
+            let _ = app.emit(
+                NOTICE_CHANNEL,
+                format!("下单浏览器预热没有完成：{error}。到货时仍会打开下单浏览器结账。"),
+            );
+            return;
+        }
+    };
+    if opened {
+        let _ = app.emit(
+            NOTICE_CHANNEL,
+            "下单浏览器已在后台打开并停在购物袋，到货时直接接着用。",
+        );
+    }
+    if let Some(signed_in) = signed_in {
+        report_sign_in(app, signed_in);
+    }
+}
+
+/// 推送下单浏览器的登录状态；状态有变化时再写一行日志。
+fn report_sign_in(app: &AppHandle, signed_in: bool) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let checked_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default();
+    let _ = app.emit(
+        CHECKOUT_SIGN_IN_CHANNEL,
+        CheckoutSignIn {
+            signed_in,
+            checked_at_ms,
+        },
+    );
+    let current = if signed_in { 1 } else { 2 };
+    if state.checkout_signed_in.swap(current, Ordering::AcqRel) == current {
+        return;
+    }
+    let _ = app.emit(
+        NOTICE_CHANNEL,
+        if signed_in {
+            "下单浏览器：已确认 Apple 账户处于登录状态。"
+        } else {
+            "下单浏览器：Apple 账户没有登录。到货时结账会先要求登录，建议现在点顶部提醒里的「登录」。"
+        },
+    );
+}
+
 /// 试跑自动结账，走到「查看订单」页为止，无论设置如何都不提交订单。
 #[tauri::command]
 async fn test_checkout(
@@ -1142,24 +1326,24 @@ async fn test_checkout(
     }
 }
 
-/// 到货后执行自动结账，并把结果通知用户。
+/// 到货后执行自动结账，并把结果通知用户。返回这次结账是否失败。
 ///
 /// 成功后是否关闭总开关由用户选择；提交结果不明时仍强制停止自动结账。
-async fn run_checkout_on_hit(app: AppHandle, target: Target) {
+async fn run_checkout_on_hit(app: AppHandle, target: Target) -> bool {
     let Some(state) = app.try_state::<AppState>() else {
-        return;
+        return false;
     };
     let settings = state.settings_snapshot();
     let bark_url = settings.bark_url_for(&target).to_owned();
     if !settings.checkout.enabled || !settings.is_checkout_target(&target) {
-        return;
+        return false;
     }
     if !settings.checkout.has_national_id_suffix() {
         let _ = app.emit(
             NOTICE_CHANNEL,
             "自动结账未执行：还没有填写取货人证件号码后四位。",
         );
-        return;
+        return false;
     }
     let plan = CheckoutPlan::new(
         &target,
@@ -1202,6 +1386,7 @@ async fn run_checkout_on_hit(app: AppHandle, target: Target) {
         serde_json::json!({"attempt": attempt, "target": audit_target, "result": audit_result}),
     );
     let pause_after_checkout = should_pause_monitoring(&state.settings_snapshot(), Some(&result));
+    let failed = result.is_err();
     let (title, body) = match result {
         Ok(outcome) => {
             let mut next = state.settings_snapshot();
@@ -1301,6 +1486,7 @@ async fn run_checkout_on_hit(app: AppHandle, target: Target) {
     if let Err(err) = dispatch_notification(&app, Notification::new(title, body), &bark_url).await {
         let _ = app.emit(NOTICE_CHANNEL, format!("发送结账提醒时出错：{err}"));
     }
+    failed
 }
 
 fn should_disable_checkout_after_failure(error: &checkout::CheckoutError) -> bool {
@@ -1423,7 +1609,10 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
                 serde_json::json!({"cycle": cycle, "elapsedMs": elapsed_ms, "healthy": healthy, "targetCount": snapshot.len(), "inStockCount": snapshot.iter().filter(|s| s.availability.is_in_stock()).count()}),
             ),
             Event::RunStateChanged { running } => {
-                checkout_audit("runStateChanged", serde_json::json!({"running": running}))
+                checkout_audit("runStateChanged", serde_json::json!({"running": running}));
+                if *running {
+                    warm_checkout(&app);
+                }
             }
             Event::Trouble { .. } => {
                 checkout_audit("trouble", serde_json::json!({"needsInspection": true}))
@@ -1449,8 +1638,13 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
                 let app = app.clone();
                 let target = target.clone();
                 tauri::async_runtime::spawn(async move {
-                    let _reservation = reservation;
-                    run_checkout_on_hit(app, target).await;
+                    let failed = run_checkout_on_hit(app.clone(), target).await;
+                    // 先放开名额再预热：名额还占着时预热会以为正在结账而跳过。
+                    drop(reservation);
+                    if failed {
+                        // 提交前失败会关掉下单页面；监控还在跑就重新在后台准备好。
+                        warm_checkout(&app);
+                    }
                 });
             }
             if should_pause_monitoring(&settings, None) {
@@ -1689,10 +1883,15 @@ pub fn run() {
                 let network = settings.network.clone();
                 let targets = settings.targets.clone();
                 let interval = settings.interval();
+                let aligned_checks = settings.aligned_checks.clone();
+                let aligned_only = settings.aligned_only;
                 tauri::async_runtime::spawn(async move {
                     fetcher.set_network(network).await;
                     watcher.set_targets(targets).await;
                     watcher.set_interval(interval).await;
+                    watcher
+                        .set_aligned_checks(aligned_checks, aligned_only)
+                        .await;
                     // 仅本地验收启动命令显式指定时恢复原有监控，普通启动仍保持暂停。
                     if std::env::var_os("APW_MONITOR_AUTOSTART").is_some_and(|v| v == "1") {
                         watcher.start().await;
@@ -1708,6 +1907,8 @@ pub fn run() {
                 http: reqwest::Client::new(),
                 settings: RwLock::new(settings),
                 store,
+                checkout_keeper: AtomicBool::new(false),
+                checkout_signed_in: AtomicU8::new(0),
             });
 
             let handle: AppHandle = app.handle().clone();
@@ -1758,9 +1959,12 @@ pub fn run() {
             start_watching,
             stop_watching,
             retry_watching_now,
+            query_now,
             is_running,
             test_notify,
             open_checkout_browser,
+            sign_in_checkout_browser,
+            check_checkout_sign_in,
             test_checkout,
             checkout_login::checkout_login_status,
             checkout_login::save_checkout_login,

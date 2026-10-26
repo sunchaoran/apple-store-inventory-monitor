@@ -23,7 +23,7 @@ registerHooks({
 });
 
 const defaults = {
-  locale: "zh_CN", targets: [], intervalSeconds: 30,
+  locale: "zh_CN", targets: [], intervalSeconds: 30, alignedChecks: [0, 30], alignedOnly: false,
   deliveryRegion: null,
   barkUrl: "https://example.invalid/old", soundEnabled: true, openOnHit: "bag", stopOnHit: false,
   productBarkUrls: {},
@@ -179,4 +179,25 @@ test("a product-specific Bark URL can be set and cleared", async () => {
 
   assert.equal(await ctx.store.setProductBarkUrl(target, ""), true);
   assert.deepEqual(ctx.persisted().productBarkUrls, {});
+});
+
+test("立即查询被接受时转为正在查询，监控未运行时只记一条日志", async () => {
+  let accepted = true;
+  const calls = [];
+  invoke = async (command) => {
+    calls.push(command);
+    return accepted;
+  };
+  const store = await import(`../src/lib/store.ts?query-now=${++generation}`);
+
+  assert.equal(await store.queryNow(), true);
+  assert.deepEqual(calls, ["query_now"], "立即查询不该走清除冷却的立即重试");
+  let ui = store.watcherStore.getSnapshot();
+  assert.equal(ui.nextCheckAtMs, null);
+  assert.match(ui.logs.at(-1), /立即查询一轮/);
+
+  accepted = false;
+  assert.equal(await store.queryNow(), false);
+  ui = store.watcherStore.getSnapshot();
+  assert.match(ui.logs.at(-1), /监控当前未运行，无法立即查询/);
 });

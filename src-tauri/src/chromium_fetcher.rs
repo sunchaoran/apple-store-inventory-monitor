@@ -12,14 +12,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apw_core::apple::{
-    ApiError, CycleStats, DeliveryInfo as ProductDelivery, Fetcher, ScheduleHint,
+    ApiError, BlockedRoute, CycleStats, DeliveryInfo as ProductDelivery, Fetcher, ScheduleHint,
     StoreAvailability, parse_pickup_message,
 };
 use apw_core::config::{NetworkMode, NetworkSettings};
-use apw_core::model::{DeliveryRegion, Region, Target};
+use apw_core::model::{DeliveryRegion, Region, Target, region_by_locale};
 use apw_core::watcher::MAX_PARTS_PER_REQUEST;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -30,7 +30,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 
 use crate::browser_support::startup_exit_detail;
 use crate::clash::ClashController;
+use crate::exit_backoff::ExitBackoff;
 use crate::route_pool::RoutePool;
+use crate::system_proxy;
 
 const CHROME_START_TIMEOUT: Duration = Duration::from_secs(12);
 const DEVTOOLS_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
@@ -278,6 +280,20 @@ fn chromium_network_args(network: &NetworkSettings) -> Vec<String> {
             "--proxy-server=http://127.0.0.1:{}",
             network.clash.proxy_port
         )],
+    }
+}
+
+/// 查询请求实际经过的出口。只有它变了，之前的被拒记录才作废；改 Clash 密钥这类
+/// 不影响出口的设置，不能顺手解除正在进行的放慢探测。
+fn exit_identity(network: &NetworkSettings) -> String {
+    let clash = &network.clash;
+    match network.mode {
+        NetworkMode::System => "system".into(),
+        NetworkMode::Pinned => format!("pinned|{}|{}", clash.proxy_port, clash.pinned_node),
+        NetworkMode::Clash => format!(
+            "clash|{}|{}|{}|{}",
+            clash.proxy_port, clash.controller, clash.group, clash.node_filter
+        ),
     }
 }
 
@@ -1444,13 +1460,22 @@ struct QueryState {
     ///
     /// 541/403/429 发生后继续为同地区逐店发请求，不会提高成功率，只会把
     /// 一轮查询从十几秒拖到数分钟。这里只短路当前轮次；`begin_cycle` 会清空它，
-    /// 下一轮仍按用户设置的间隔复用同一会话探测，不是保护冷却或指数退避。
+    /// 下一轮复用同一会话探测。跨轮次的放慢探测由 `backoff` 负责。
     pickup_rejections: HashMap<&'static str, CyclePickupRejection>,
+    /// 各 Apple 站点从第一次被拒起的记录。只有一个出口时，连续几轮被拒后据此
+    /// 放慢探测；任何模式下都供界面说明被拦了多久、走的是哪个出口。
+    backoff: ExitBackoff,
+    /// 轮次编号，只用来把同一轮里的多次被拒算作一轮。
+    cycle: u64,
     /// 本轮已经被旧 fulfillment 送货接口拒绝的地区。
     ///
-    /// 同轮不再重复请求，避免一轮里连续触发 541；新一轮立即清空，继续按用户设置
-    /// 的频率查询，不建立跨轮次冷却。它也不能阻断门店取货查询。
+    /// 同轮不再重复请求，避免一轮里连续触发 541；新一轮立即清空。跨轮次的放慢
+    /// 由 `delivery_backoff` 负责。它不能阻断门店取货查询。
     delivery_rejections: HashSet<&'static str>,
+    /// 送货接口单独的被拒记录。实测取货已经恢复时送货接口仍可能连续返回 541，
+    /// 每轮照问只会让会话一直挨拒；连续几轮被拒后就放慢送货查询，沿用上次取得的
+    /// 送货信息。只管送货：不推迟下一轮，也不让取货进入冷却或挂出告警。
+    delivery_backoff: ExitBackoff,
     delivery_cache: HashMap<DeliveryCacheKey, CachedDelivery>,
     /// 成功响应中的空文案、仅购买状态和缺失型号短暂复用，避免逐店重查。
     empty_delivery_cache: HashMap<DeliveryCacheKey, CachedDelivery>,
@@ -1479,6 +1504,7 @@ struct QueryState {
 
 impl QueryState {
     fn begin_cycle(&mut self) {
+        self.cycle = self.cycle.wrapping_add(1);
         self.session_start_failure = None;
         self.pickup_cache.clear();
         self.nearby_parts.clear();
@@ -1561,22 +1587,25 @@ impl QueryState {
     }
 
     fn schedule_hint(&mut self, locales: &[String]) -> ScheduleHint {
-        if self.network.mode != NetworkMode::Clash {
-            return ScheduleHint::default();
-        }
         let now = Instant::now();
         let sites: BTreeSet<String> = locales
             .iter()
-            .filter_map(|locale| apw_core::model::region_by_locale(locale))
+            .filter_map(|locale| region_by_locale(locale))
             .map(region_site)
             .collect();
         let waits: Vec<Option<Duration>> = sites
             .iter()
-            .map(|site| self.routes.wait_for(site, now))
+            .map(|site| {
+                if self.single_exit() {
+                    self.backoff.wait_for(site, now)
+                } else {
+                    self.routes.wait_for(site, now)
+                }
+            })
             .collect();
         let cooling = waits.iter().any(Option::is_some);
-        // 只要还有一个站点能查，就按用户间隔继续；全部站点都没有可用节点时，
-        // 等到最早恢复的那条线路再开始下一轮。
+        // 只要还有一个站点能查，就按用户间隔继续；全部站点都在等待时（没有可用
+        // 节点，或唯一的出口正在放慢探测），等到最早恢复的那个再开始下一轮。
         let delay = if !waits.is_empty() && waits.iter().all(Option::is_some) {
             waits.into_iter().flatten().min().unwrap_or_default()
         } else {
@@ -1643,6 +1672,12 @@ impl QueryState {
             self.dead_routes.clear();
             self.cooling_announced.clear();
         }
+        if exit_identity(&self.network) != exit_identity(&network) {
+            // 换了出口，旧出口上的被拒记录和放慢探测都不再适用。
+            self.backoff = ExitBackoff::default();
+            self.delivery_backoff = ExitBackoff::default();
+            self.cooling_announced.clear();
+        }
         self.clash = uses_clash.then(|| ClashController::new(&network.clash));
         self.network = network;
         self.routes_loaded = false;
@@ -1652,6 +1687,11 @@ impl QueryState {
     /// 是否处于自动切换节点的轮换模式。指定节点模式只固定使用一个节点。
     fn rotating(&self) -> bool {
         self.network.mode == NetworkMode::Clash && self.clash.is_some()
+    }
+
+    /// 是否只有一个出口：跟随系统代理或指定节点。被拒后无路可换，只能放慢探测。
+    fn single_exit(&self) -> bool {
+        self.network.mode != NetworkMode::Clash
     }
 
     fn clash_controller(&self) -> Result<ClashController, String> {
@@ -1881,6 +1921,69 @@ impl QueryState {
                 .is_some()
     }
 
+    /// 记下一次被拒；只有一个出口时，连续几轮被拒后开始放慢探测。
+    async fn record_rejection(&mut self, region: &'static Region) {
+        let site = region_site(region);
+        let route = match self.network.mode {
+            NetworkMode::System => system_proxy::label().await,
+            NetworkMode::Pinned | NetworkMode::Clash => self.route_label(),
+        };
+        if let Some(wait) = self.backoff.reject(
+            &site,
+            route.clone(),
+            self.cycle,
+            self.single_exit(),
+            Instant::now(),
+            SystemTime::now(),
+        ) {
+            eprintln!(
+                "{route} 在 {site} 连续被 Apple 拒绝，放慢探测，{} 分钟后再试",
+                wait.as_secs().div_ceil(60)
+            );
+        }
+    }
+
+    /// 拿到正常响应：清除被拒记录，下一轮恢复用户设置的间隔。
+    fn record_success(&mut self, region: &'static Region) {
+        let site = region_site(region);
+        if self.backoff.succeed(&site) {
+            eprintln!("{} 在 {site} 恢复正常响应", self.route_label());
+        }
+        self.cooling_announced.remove(&site);
+    }
+
+    /// 唯一的出口正在放慢探测时不向 Apple 发请求，直接说明还要等多久。
+    fn probe_wait(&mut self, region: &'static Region) -> Option<ApiError> {
+        if !self.single_exit() {
+            return None;
+        }
+        let site = region_site(region);
+        let remaining = self.backoff.wait_for(&site, Instant::now())?;
+        let route = self
+            .backoff
+            .streak(&site)
+            .map_or_else(|| self.route_label(), |streak| streak.route.clone());
+        Some(ApiError::CoolingDown {
+            remaining_seconds: remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0),
+            detail: format!("{route} 连续被 Apple 拒绝，已放慢探测"),
+            newly_started: self.cooling_announced.insert(site),
+        })
+    }
+
+    /// 界面展示用：被拒最久的出口。
+    fn blocked_route(&self) -> Option<BlockedRoute> {
+        let streak = self.backoff.longest()?;
+        Some(BlockedRoute {
+            route: streak.route.clone(),
+            since_ms: streak
+                .since
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis().min(u128::from(u64::MAX)) as u64)
+                .unwrap_or_default(),
+            rejections: streak.rejections,
+        })
+    }
+
     fn route_succeeded(&mut self, region: &'static Region) {
         if !self.rotating() {
             return;
@@ -1917,6 +2020,16 @@ impl QueryState {
             };
             attempts += 1;
             let result = result.map_err(|error| self.explain_proxy_error(error));
+            let rejected = match &result {
+                Err(ApiError::Blocked(_) | ApiError::RateLimited(_)) => true,
+                Ok(payload) => is_rejected_payload(payload),
+                Err(_) => false,
+            };
+            if rejected {
+                self.record_rejection(region).await;
+            } else if matches!(&result, Ok(payload) if payload.status == 200) {
+                self.record_success(region);
+            }
             let switch = match &result {
                 Err(ApiError::Blocked(_) | ApiError::RateLimited(_)) => self.route_rejected(region),
                 Ok(payload) if is_rejected_payload(payload) => self.route_rejected(region),
@@ -1953,8 +2066,12 @@ impl QueryState {
         }
     }
 
+    /// 用户点「立即重试」：清除全部冷却保护——节点冷却和档位、单一出口的放慢探测、
+    /// 送货查询的放慢——被拒轮次从头计算。被拒的起始时间和次数照旧保留在告警里。
     fn retry_now(&mut self) {
-        self.routes.release_waits(Instant::now());
+        self.routes.clear_cooldowns();
+        self.backoff.reset_protection();
+        self.delivery_backoff.reset_protection();
         self.dead_routes.clear();
         self.route_failure = None;
         self.cooling_announced.clear();
@@ -1992,8 +2109,40 @@ impl QueryState {
         self.delivery_rejections.contains(region.locale)
     }
 
-    fn reject_delivery_for_cycle(&mut self, region: &'static Region) {
+    /// 这一轮不再查送货：本轮已被拒，或连续被拒后还在放慢期间。
+    fn delivery_paused(&self, region: &'static Region) -> bool {
+        self.delivery_rejected_this_cycle(region)
+            || self
+                .delivery_backoff
+                .wait_for(&region_site(region), Instant::now())
+                .is_some()
+    }
+
+    /// 送货接口拒绝了这次查询：本轮同地区不再请求，连续几轮被拒后放慢送货查询。
+    fn reject_delivery(&mut self, region: &'static Region) {
         self.delivery_rejections.insert(region.locale);
+        let site = region_site(region);
+        if let Some(wait) = self.delivery_backoff.reject(
+            &site,
+            self.route_label(),
+            self.cycle,
+            true,
+            Instant::now(),
+            SystemTime::now(),
+        ) {
+            eprintln!(
+                "送货查询在 {site} 连续被 Apple 拒绝，放慢，{} 分钟后再查送货日期；取货查询照常",
+                wait.as_secs().div_ceil(60)
+            );
+        }
+    }
+
+    /// 送货接口正常响应：清除被拒记录，之后按缓存规则照常查询送货。
+    fn delivery_succeeded(&mut self, region: &'static Region) {
+        let site = region_site(region);
+        if self.delivery_backoff.succeed(&site) {
+            eprintln!("送货查询在 {site} 恢复正常响应");
+        }
     }
 }
 
@@ -2126,6 +2275,9 @@ impl AppleChromiumFetcher {
             }
             (BrowserPayload { status: 200, body }, true)
         } else {
+            if let Some(error) = guard.probe_wait(region) {
+                return Err(error);
+            }
             if guard.session.is_none() {
                 let network_args = chromium_network_args(&guard.network);
                 match ChromiumSession::start_with_args(self.profile_dir.clone(), &network_args)
@@ -2274,7 +2426,7 @@ impl AppleChromiumFetcher {
                         .collect();
                     missing_parts.sort_unstable();
                     missing_parts.dedup();
-                    if !missing_parts.is_empty() && !guard.delivery_rejected_this_cycle(region) {
+                    if !missing_parts.is_empty() && !guard.delivery_paused(region) {
                         for target in targets.iter().filter(|target| {
                             target.kit_part.is_none() && missing_parts.contains(&target.part_number)
                         }) {
@@ -2302,18 +2454,19 @@ impl AppleChromiumFetcher {
                                         .unwrap_or_default();
                                     guard.cache_delivery(target, location, info);
                                 }
+                                guard.delivery_succeeded(region);
                             }
                             Err(error) => {
                                 eprintln!("普通商品送货查询失败：{error}");
                                 if matches!(error, ApiError::Blocked(_) | ApiError::RateLimited(_))
                                 {
-                                    guard.reject_delivery_for_cycle(region);
+                                    guard.reject_delivery(region);
                                 }
                             }
                         }
                     }
                     for target in targets.iter().filter(|target| target.kit_part.is_some()) {
-                        if guard.delivery_rejected_this_cycle(region) {
+                        if guard.delivery_paused(region) {
                             break;
                         }
                         if !guard.needs_delivery(target, location) {
@@ -2331,22 +2484,26 @@ impl AppleChromiumFetcher {
                                 .await
                         };
                         match fetched {
-                            Ok(Some(message)) => guard.cache_delivery(
-                                target,
-                                location,
-                                ProductDelivery {
-                                    sale_reason: None,
-                                    sale_message: Some(message),
-                                },
-                            ),
+                            Ok(Some(message)) => {
+                                guard.cache_delivery(
+                                    target,
+                                    location,
+                                    ProductDelivery {
+                                        sale_reason: None,
+                                        sale_message: Some(message),
+                                    },
+                                );
+                                guard.delivery_succeeded(region);
+                            }
                             Ok(None) => {
-                                guard.cache_delivery(target, location, ProductDelivery::default())
+                                guard.cache_delivery(target, location, ProductDelivery::default());
+                                guard.delivery_succeeded(region);
                             }
                             Err(error) => {
                                 eprintln!("Watch 送货查询失败（{}）：{error}", target.part_number);
                                 if matches!(error, ApiError::Blocked(_) | ApiError::RateLimited(_))
                                 {
-                                    guard.reject_delivery_for_cycle(region);
+                                    guard.reject_delivery(region);
                                 }
                             }
                         }
@@ -2364,7 +2521,7 @@ impl AppleChromiumFetcher {
             }
             403 | 541 => {
                 // 保留专属 Profile、Cookie 和当前会话，显示 Apple 页面便于完成必要的
-                // 浏览器校验。只短路本轮同地区；下一轮按用户设置的间隔复用它。
+                // 浏览器校验。只短路本轮同地区；下一轮复用它，连续被拒时由 backoff 放慢。
                 let detail = format!("HTTP {}", payload.status);
                 guard
                     .reject_pickup_for_cycle(region, CyclePickupRejection::Blocked(detail.clone()));
@@ -2402,7 +2559,16 @@ impl Fetcher for AppleChromiumFetcher {
     }
 
     async fn plan_cycle(&self, groups: &[Vec<Target>]) {
-        self.state.lock().await.nearby_parts = plan_nearby_parts(groups);
+        let sites: HashSet<String> = groups
+            .iter()
+            .flatten()
+            .filter_map(|target| region_by_locale(&target.locale))
+            .map(region_site)
+            .collect();
+        let mut state = self.state.lock().await;
+        state.nearby_parts = plan_nearby_parts(groups);
+        state.backoff.retain_sites(&sites);
+        state.delivery_backoff.retain_sites(&sites);
     }
 
     async fn cached_delivery(
@@ -2420,6 +2586,7 @@ impl Fetcher for AppleChromiumFetcher {
             request_count: state.gate.cycle_request_count,
             reused_response_count: state.cycle_reused_response_count,
             route: state.route_summary(),
+            blocked: state.blocked_route(),
         }
     }
 
@@ -3004,6 +3171,7 @@ pub(crate) mod tests {
                     request_count: 1,
                     reused_response_count: 5,
                     route: None,
+                    blocked: None,
                 }
             );
         }
@@ -3046,6 +3214,7 @@ pub(crate) mod tests {
                 request_count: 2,
                 reused_response_count: 1,
                 route: None,
+                blocked: None,
             }
         );
         let requests = requests.lock().await;
@@ -3259,6 +3428,104 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn 送货连续三轮被拒后只放慢送货且成功一次即恢复() {
+        const SITE: &str = "www.apple.com.cn";
+        let pickup = || pickup_response(&["R683"], "regular-two", "unavailable");
+        let (fetcher, peer) = cdp_responses(vec![
+            pickup(),
+            http_response(541),
+            pickup(),
+            http_response(541),
+            pickup(),
+            http_response(541),
+            pickup(), // 放慢期间只查取货
+            pickup(),
+            product_delivery_response("regular-two", "明天"),
+        ])
+        .await;
+        let region = region_by_locale("zh_CN").unwrap();
+        let destination = DeliveryRegion {
+            state: "北京".into(),
+            city: "北京".into(),
+            district: "朝阳区".into(),
+        };
+        let round = || async {
+            fetcher.begin_cycle().await;
+            fetcher.state.lock().await.gate.last_sent = None;
+            fetcher
+                .pickup_message(
+                    region,
+                    "R683",
+                    &[test_target("regular-two")],
+                    Some(&destination),
+                )
+                .await
+                .expect("送货被拒不能让取货失败")
+        };
+
+        for _ in 0..3 {
+            round().await;
+            assert_eq!(fetcher.cycle_stats().await.request_count, 2);
+        }
+        {
+            let state = fetcher.state.lock().await;
+            assert!(
+                state
+                    .delivery_backoff
+                    .wait_for(SITE, Instant::now())
+                    .is_some(),
+                "连续三轮被拒后应放慢送货查询"
+            );
+            assert!(
+                state.backoff.streak(SITE).is_none(),
+                "送货被拒不能算作取货被拒"
+            );
+        }
+        assert_eq!(
+            fetcher.schedule_hint(&["zh_CN".into()]).await,
+            ScheduleHint::default(),
+            "送货放慢不能推迟取货轮询，也不能显示保护冷却"
+        );
+        assert_eq!(fetcher.cycle_stats().await.blocked, None);
+
+        let paused = round().await;
+        assert!(!paused.parts["regular-two"].availability.is_in_stock());
+        assert_eq!(
+            fetcher.cycle_stats().await.request_count,
+            1,
+            "放慢期间只发取货请求，不再碰送货接口"
+        );
+
+        // 不等放慢结束，直接清掉送货的冷却保护再探测一次，这次 Apple 正常响应。
+        fetcher
+            .state
+            .lock()
+            .await
+            .delivery_backoff
+            .reset_protection();
+        let recovered = round().await;
+        assert_eq!(fetcher.cycle_stats().await.request_count, 2);
+        assert_eq!(
+            recovered.parts["regular-two"]
+                .pickup_details
+                .as_ref()
+                .and_then(|details| details.sale_message.as_deref()),
+            Some("明天")
+        );
+        assert!(
+            fetcher
+                .state
+                .lock()
+                .await
+                .delivery_backoff
+                .streak(SITE)
+                .is_none(),
+            "成功一次就清除送货的被拒记录"
+        );
+        assert!(!peer.await.unwrap());
+    }
+
+    #[tokio::test]
     async fn 缓存取货响应仍会合并配送信息() {
         let region = region_by_locale("zh_CN").unwrap();
         let fetcher = AppleChromiumFetcher::new();
@@ -3317,6 +3584,7 @@ pub(crate) mod tests {
                 request_count: 0,
                 reused_response_count: 1,
                 route: None,
+                blocked: None,
             }
         );
     }
@@ -3915,6 +4183,186 @@ pub(crate) mod tests {
         assert!(
             !peer.await.unwrap(),
             "从 541 恢复到正常响应的过程不应断开原 Chromium 会话"
+        );
+    }
+
+    /// 模拟一轮查询：清空本轮状态并跳过两秒节流，再查一家门店。
+    async fn query_round(
+        fetcher: &AppleChromiumFetcher,
+        store: &str,
+    ) -> Result<StoreAvailability, ApiError> {
+        fetcher.begin_cycle().await;
+        fetcher.state.lock().await.gate.last_sent = None;
+        fetcher
+            .pickup_message(
+                region_by_locale("zh_CN").unwrap(),
+                store,
+                &[test_target("MG6X4CH/A")],
+                None,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn 跟随系统代理时连续三轮被拒后放慢探测且期间不发请求() {
+        let (fetcher, _peer, requests) = cdp_recorded_responses(vec![
+            http_response(541),
+            http_response(541),
+            http_response(541),
+        ])
+        .await;
+        let locales = ["zh_CN".to_string()];
+
+        for round in 1..=3 {
+            let result = query_round(&fetcher, "R390").await;
+            assert!(
+                matches!(result, Err(ApiError::Blocked(_))),
+                "第 {round} 轮应如实报告被拦截"
+            );
+            let hint = fetcher.schedule_hint(&locales).await;
+            if round < 3 {
+                assert_eq!(
+                    hint,
+                    ScheduleHint::default(),
+                    "前两轮仍按用户设置的间隔重试"
+                );
+            } else {
+                assert!(hint.cooling, "放慢探测时界面应显示保护冷却");
+                assert!(
+                    hint.delay > Duration::from_secs(110) && hint.delay <= Duration::from_secs(120),
+                    "第三轮被拒后等两分钟再探测：{:?}",
+                    hint.delay
+                );
+            }
+        }
+
+        let blocked = fetcher
+            .cycle_stats()
+            .await
+            .blocked
+            .expect("被拒期间应告诉界面走的哪个出口、被拒多久");
+        assert_eq!(blocked.rejections, 3);
+        assert!(
+            blocked.route.starts_with("系统"),
+            "跟随系统代理时说明系统代理：{}",
+            blocked.route
+        );
+        let since = UNIX_EPOCH + Duration::from_millis(blocked.since_ms);
+        assert!(SystemTime::now().duration_since(since).unwrap() < Duration::from_secs(60));
+
+        // 放慢期间即使暂停后重新开始也不发请求，直接说明还要等多久；告警只出一次。
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(500), query_round(&fetcher, "R390"))
+                .await
+                .expect("放慢期间不能等浏览器响应");
+        assert!(matches!(
+            &waiting,
+            Err(ApiError::CoolingDown { newly_started: true, remaining_seconds, detail })
+                if *remaining_seconds > 100 && detail.contains("已放慢探测")
+        ));
+        let other_store = fetcher
+            .pickup_message(
+                region_by_locale("zh_CN").unwrap(),
+                "R683",
+                &[test_target("MG6X4CH/A")],
+                None,
+            )
+            .await;
+        assert!(matches!(
+            other_store,
+            Err(ApiError::CoolingDown {
+                newly_started: false,
+                ..
+            })
+        ));
+        assert_eq!(fetcher.cycle_stats().await.request_count, 0);
+        assert_eq!(
+            requests.lock().await.len(),
+            3,
+            "放慢期间不能向 Apple 发请求"
+        );
+    }
+
+    #[tokio::test]
+    async fn 立即重试清除冷却保护_成功一次即恢复原间隔() {
+        let mut responses = vec![http_response(541); 6];
+        responses.push(pickup_response(&["R390"], "MG6X4CH/A", "unavailable"));
+        let (fetcher, _peer) = cdp_responses(responses).await;
+        let locales = ["zh_CN".to_string()];
+        let rejected = || async {
+            assert!(matches!(
+                query_round(&fetcher, "R390").await,
+                Err(ApiError::Blocked(_))
+            ));
+        };
+        for _ in 0..3 {
+            rejected().await;
+        }
+        assert!(fetcher.schedule_hint(&locales).await.cooling);
+
+        // 立即重试清除冷却保护：探测仍被拒也不立刻放慢，要重新连续被拒三轮。
+        fetcher.retry_now().await;
+        assert_eq!(
+            fetcher.schedule_hint(&locales).await,
+            ScheduleHint::default()
+        );
+        rejected().await;
+        assert_eq!(
+            fetcher.schedule_hint(&locales).await,
+            ScheduleHint::default(),
+            "清除后第一次被拒仍按用户设置的间隔"
+        );
+        assert_eq!(
+            fetcher.cycle_stats().await.blocked.unwrap().rejections,
+            4,
+            "被拒次数照旧累计，告警说明不受影响"
+        );
+        rejected().await;
+        rejected().await;
+        let hint = fetcher.schedule_hint(&locales).await;
+        assert!(
+            hint.cooling
+                && hint.delay > Duration::from_secs(110)
+                && hint.delay <= Duration::from_secs(120),
+            "重新连续被拒三轮后从第一档（两分钟）开始放慢：{:?}",
+            hint.delay
+        );
+
+        fetcher.retry_now().await;
+        query_round(&fetcher, "R390")
+            .await
+            .expect("Apple 恢复后应拿到正常响应");
+        assert_eq!(
+            fetcher.schedule_hint(&locales).await,
+            ScheduleHint::default(),
+            "成功一次就恢复用户设置的间隔"
+        );
+        assert_eq!(fetcher.cycle_stats().await.blocked, None);
+    }
+
+    #[test]
+    fn 换出口才清除被拒记录() {
+        const SITE: &str = "www.apple.com.cn";
+        let now = Instant::now();
+        let mut state = QueryState::default();
+        for cycle in 1..=3 {
+            state
+                .backoff
+                .reject(SITE, "系统代理".into(), cycle, true, now, SystemTime::now());
+        }
+
+        // 改 Clash 密钥不影响跟随系统代理的出口，不能借此跳过放慢探测。
+        let mut network = NetworkSettings::default();
+        network.clash.secret = "changed".into();
+        state.set_network(network.clone());
+        assert!(state.backoff.wait_for(SITE, now).is_some());
+
+        network.mode = NetworkMode::Pinned;
+        state.set_network(network);
+        assert_eq!(state.backoff.wait_for(SITE, now), None);
+        assert!(
+            state.backoff.longest().is_none(),
+            "换了出口，旧的被拒记录不再适用"
         );
     }
 
@@ -4535,6 +4983,7 @@ pub(crate) mod tests {
                 request_count: 1,
                 reused_response_count: 5,
                 route: None,
+                blocked: None,
             }
         );
     }
@@ -4820,6 +5269,7 @@ pub(crate) mod tests {
             stats.route.as_deref(),
             Some("Clash 节点 日本01（本轮切换 1 次）")
         );
+        assert_eq!(stats.blocked, None, "换节点拿到正常响应后不再算被拒");
     }
 
     #[tokio::test]
@@ -4859,6 +5309,15 @@ pub(crate) mod tests {
         let hint = fetcher.schedule_hint(&["zh_CN".into()]).await;
         assert!(hint.cooling);
         assert!(hint.delay > Duration::from_secs(290));
+        assert_eq!(
+            fetcher
+                .cycle_stats()
+                .await
+                .blocked
+                .map(|blocked| (blocked.route, blocked.rejections)),
+            Some(("Clash 节点 香港01".to_string(), 1)),
+            "轮换模式也告诉界面哪个出口被拒，但等待由线路池决定"
+        );
         // 另一个站点仍有可用节点时，不推迟整轮。
         let mixed = fetcher
             .schedule_hint(&["zh_CN".into(), "ja_JP".into()])
@@ -5086,6 +5545,7 @@ pub(crate) mod tests {
             ready_response(),
             http_response(541),
             http_response(541),
+            http_response(541),
         ])
         .await;
         {
@@ -5142,6 +5602,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             fetcher.cycle_stats().await.route.as_deref(),
+            Some("指定节点 日本01")
+        );
+
+        // 第三轮仍被拒：指定节点也只有这一个出口，开始放慢探测。
+        let third = query_round(&fetcher, "R390").await;
+        assert!(matches!(third, Err(ApiError::Blocked(_))));
+        let hint = fetcher.schedule_hint(&["zh_CN".into()]).await;
+        assert!(hint.cooling && hint.delay > Duration::from_secs(110));
+        assert_eq!(
+            fetcher
+                .cycle_stats()
+                .await
+                .blocked
+                .map(|blocked| blocked.route)
+                .as_deref(),
             Some("指定节点 日本01")
         );
     }

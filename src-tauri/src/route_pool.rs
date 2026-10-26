@@ -182,11 +182,10 @@ impl RoutePool {
                 .any(|((name, _), cooldown)| name == route && cooldown.until > now)
     }
 
-    /// 用户要求立即重试：结束所有等待，但保留档位。探测若仍被拒，会继续升档。
-    pub fn release_waits(&mut self, now: Instant) {
-        for cooldown in self.cooldowns.values_mut() {
-            cooldown.until = cooldown.until.min(now);
-        }
+    /// 用户要求立即重试：清除所有节点的冷却和档位，连不通的标记也一并清掉。
+    /// 之后再被拒，从第一档重新开始。
+    pub fn clear_cooldowns(&mut self) {
+        self.cooldowns.clear();
         self.unreachable.clear();
     }
 }
@@ -284,13 +283,18 @@ mod tests {
     }
 
     #[test]
-    fn 立即重试结束等待但保留档位() {
+    fn 立即重试清除冷却和档位() {
         let now = Instant::now();
         let mut pool = pool(&["香港01"]);
         pool.block("香港01", SITE, now);
-        pool.release_waits(now);
+        pool.block("香港01", SITE, now + COOLDOWN_STEPS[0]);
+        pool.clear_cooldowns();
         assert!(pool.is_available("香港01", SITE, now));
-        assert_eq!(pool.block("香港01", SITE, now), COOLDOWN_STEPS[1]);
+        assert_eq!(
+            pool.block("香港01", SITE, now),
+            COOLDOWN_STEPS[0],
+            "清除后再被拒从第一档开始"
+        );
     }
 
     #[test]
@@ -331,7 +335,7 @@ mod tests {
         let mut pool = pool(&["香港01"]);
         pool.mark_unreachable("香港01", now);
         assert_eq!(pool.wait_for(SITE, now), Some(UNREACHABLE_COOLDOWN));
-        pool.release_waits(now);
+        pool.clear_cooldowns();
         assert_eq!(pool.choose(SITE, now), Some("香港01"));
     }
 

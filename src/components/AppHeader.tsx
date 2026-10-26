@@ -62,17 +62,26 @@ export function AppHeader({
   clockMs,
   isRetrying,
   onRetryNow,
+  isQuerying,
+  onQueryNow,
   onShowCheckout,
 }: {
   ui: UiState;
   clockMs: number;
   isRetrying: boolean;
   onRetryNow: () => void;
+  isQuerying: boolean;
+  onQueryNow: () => void;
   onShowCheckout: () => void;
 }) {
+  const alignedOnly = ui.settings.alignedOnly && ui.settings.alignedChecks.length > 0;
+  // 还没有下一轮时间，或者时间已到、新一轮还没报上来：本轮正在查，立即查询没有意义。
+  const waiting = ui.nextCheckAtMs !== null && ui.nextCheckAtMs > clockMs;
   const run = describeRun({
     running: ui.running,
     cooling: ui.cooling,
+    alignedCheck: ui.alignedCheck,
+    alignedOnly,
     nextCheckAtMs: ui.nextCheckAtMs,
     countdownTotalMs: ui.countdownTotalMs,
     intervalSeconds: ui.settings.intervalSeconds,
@@ -161,10 +170,40 @@ export function AppHeader({
 
       <div className="flex shrink-0 items-center gap-2">
         {ui.running && ui.cooling ? (
-          <Button variant="outline" size="sm" onClick={onRetryNow} disabled={isRetrying} aria-busy={isRetrying}>
-            <RefreshCw className={isRetrying ? "animate-spin" : undefined} aria-hidden="true" />
-            {isRetrying ? "正在重试" : "立即重试"}
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button variant="outline" size="sm" onClick={onRetryNow} disabled={isRetrying} aria-busy={isRetrying}>
+                <RefreshCw className={isRetrying ? "animate-spin" : undefined} aria-hidden="true" />
+                {isRetrying ? "正在重试" : "立即重试"}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-72">
+              清除冷却保护并马上查询。仍被 Apple 拒绝时，要再连续被拒 3 轮才会重新放慢。
+            </TooltipContent>
+          </Tooltip>
+        ) : ui.running && alignedOnly ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              {/* 查询进行中按钮是禁用的，收不到悬停事件，包一层才能照常显示说明。 */}
+              <span tabIndex={waiting ? undefined : 0}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onQueryNow}
+                  disabled={isQuerying || !waiting}
+                  aria-busy={isQuerying}
+                >
+                  <RefreshCw className={isQuerying ? "animate-spin" : undefined} aria-hidden="true" />
+                  立即查询
+                </Button>
+              </span>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-72">
+              {waiting
+                ? "不等下一个勾选的时刻，马上查一轮；之后仍只在勾选的时刻查询。"
+                : "正在查询，这一轮结束后可以再点。"}
+            </TooltipContent>
+          </Tooltip>
         ) : null}
         {ui.running ? (
           <Button variant="secondary" size="sm" className="min-w-20" onClick={() => void stopWatching()}>

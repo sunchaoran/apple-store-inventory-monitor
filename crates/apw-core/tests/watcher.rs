@@ -7,9 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use apw_core::apple::{ApiError, CycleStats, Fetcher, PartStatus, ScheduleHint, StoreAvailability};
+use apw_core::apple::{
+    ApiError, BlockedRoute, CycleStats, Fetcher, PartStatus, ScheduleHint, StoreAvailability,
+};
+use apw_core::config::AlignedChecks;
 use apw_core::model::{Availability, DeliveryRegion, Region, Target, UnknownReason};
 use apw_core::watcher::{Event, TroubleAdvice, Watcher, WatcherConfig};
+use chrono::Timelike;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 
@@ -151,6 +155,9 @@ fn fast_config() -> WatcherConfig {
     WatcherConfig {
         interval: Duration::from_millis(20),
         jitter: 0.0,
+        // 定点查询看墙上时钟；测试刚好跑在整点时不能因此多出一轮。
+        aligned_checks: AlignedChecks::off(),
+        aligned_only: false,
         concurrency: 4,
         event_buffer: 256,
         delivery_region: None,
@@ -208,6 +215,11 @@ impl Fetcher for ProtectedFetcher {
             request_count: 3,
             reused_response_count: 2,
             route: Some("Clash 节点 香港01".into()),
+            blocked: Some(BlockedRoute {
+                route: "Clash 节点 香港01".into(),
+                since_ms: 1_700_000_000_000,
+                rejections: 4,
+            }),
         }
     }
 
@@ -254,17 +266,23 @@ async fn 保护冷却会驱动真实下轮时间与负载统计() {
                 reused_response_count,
                 next_check_in_secs,
                 cooling,
+                blocked,
                 ..
             } => Some((
                 *request_count,
                 *reused_response_count,
                 *next_check_in_secs,
                 *cooling,
+                blocked.as_ref().map(|blocked| blocked.rejections),
             )),
             _ => None,
         })
         .expect("应收到轮次完成事件");
-    assert_eq!(completed, (3, 2, 1, true));
+    assert_eq!(
+        completed,
+        (3, 2, 1, true, Some(4)),
+        "被拒记录应原样带给界面"
+    );
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
@@ -1175,4 +1193,165 @@ async fn 业务说明随本轮快照传递且失败后清除() {
         second_row.pickup_details.is_none(),
         "本轮失败不能继续显示上一轮未发售详情"
     );
+}
+
+#[tokio::test]
+async fn 等下一轮时读取状态不会提前查询() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let config = WatcherConfig {
+        interval: Duration::from_secs(30),
+        ..fast_config()
+    };
+    let (watcher, mut rx) = Watcher::spawn(fake.clone(), config);
+    watcher.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    watcher.start().await;
+    wait_cycle(&mut rx).await;
+
+    // 界面随时会取快照、问是否在运行，重复点开始也一样，都不该让引擎提前查一轮。
+    watcher.snapshot().await;
+    assert!(watcher.is_running().await);
+    watcher.start().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fake.call_count(), 1);
+    watcher.stop().await;
+}
+
+/// 离现在差不多半小时的那一分钟，测试期间走不到。
+fn far_minute() -> u8 {
+    ((chrono::Local::now().minute() + 30) % 60) as u8
+}
+
+fn next_check(events: &[Event]) -> (u64, bool, bool) {
+    events
+        .iter()
+        .find_map(|event| match event {
+            Event::CycleComplete {
+                next_check_in_secs,
+                cooling,
+                aligned_check,
+                ..
+            } => Some((*next_check_in_secs, *cooling, *aligned_check)),
+            _ => None,
+        })
+        .expect("应收到轮次完成事件")
+}
+
+#[tokio::test]
+async fn 只做定点查询时改设置不会提前查询而立即重试照常查询() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let marks = AlignedChecks::new([far_minute()]);
+    let config = WatcherConfig {
+        aligned_checks: marks.clone(),
+        aligned_only: true,
+        ..fast_config()
+    };
+    let (watcher, mut rx) = Watcher::spawn(fake.clone(), config);
+    watcher.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    watcher.start().await;
+
+    // 开始监控照常先查一轮，之后不按 20 毫秒的间隔，等到勾选的时刻。
+    let (next, cooling, aligned) = next_check(&wait_cycle(&mut rx).await);
+    assert!(next > 60, "只做定点查询时不该按查询间隔：{next} 秒后");
+    assert!(!cooling && aligned);
+
+    watcher.set_aligned_checks(marks.clone(), true).await;
+    watcher
+        .set_targets(vec![
+            target("R683", "MG724CH/A"),
+            target("R448", "MG0A4CH/A"),
+        ])
+        .await;
+    watcher.set_interval(Duration::from_millis(10)).await;
+    watcher
+        .set_aligned_checks(
+            AlignedChecks::new([far_minute(), (far_minute() + 1) % 60]),
+            true,
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(fake.call_count(), 1, "改设置不该在勾选的时刻之前多查");
+
+    assert!(watcher.retry_now().await);
+    tokio::time::timeout(Duration::from_millis(150), wait_cycle(&mut rx))
+        .await
+        .expect("立即重试应当马上查询");
+    assert_eq!(fake.call_count(), 3, "立即重试应当按新的监控列表查询");
+
+    // 关掉只做定点查询，回到普通模式：和改其他设置一样马上按新设置查一轮。
+    watcher.set_aligned_checks(marks, false).await;
+    tokio::time::timeout(Duration::from_millis(150), wait_cycle(&mut rx))
+        .await
+        .expect("关掉只做定点查询后应当马上恢复按间隔查询");
+    watcher.stop().await;
+}
+
+#[tokio::test]
+async fn 只做定点查询时冷却结束后也等到勾选的时刻() {
+    let now = chrono::Local::now();
+    // 下一分钟整就是勾选的时刻，但冷却要 5 分钟：应等到冷却之后的那一次，也就是一小时后。
+    let mark = ((now.minute() + 1) % 60) as u8;
+    let until_mark = 60.0 - (f64::from(now.second()) + f64::from(now.nanosecond()) / 1e9);
+    let fake = ProtectedFetcher {
+        cooldown: Duration::from_secs(300),
+        ..ProtectedFetcher::default()
+    };
+    let config = WatcherConfig {
+        aligned_checks: AlignedChecks::new([mark]),
+        aligned_only: true,
+        ..fast_config()
+    };
+    let (watcher, mut rx) = Watcher::spawn(fake, config);
+    watcher.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    watcher.start().await;
+
+    let (next, cooling, aligned) = next_check(&wait_cycle(&mut rx).await);
+    assert!(cooling && aligned);
+    let expected = 3_600.0 + until_mark;
+    assert!(
+        (next as f64 - expected).abs() <= 2.0,
+        "应等到冷却之后的第一个勾选时刻：{next} 秒后，预期约 {expected:.0} 秒"
+    );
+    watcher.stop().await;
+}
+
+#[tokio::test]
+async fn 只做定点查询时立即查询马上查一轮且不清除保护冷却() {
+    let fake = ProtectedFetcher {
+        cooldown: Duration::ZERO,
+        ..ProtectedFetcher::default()
+    };
+    let config = WatcherConfig {
+        aligned_checks: AlignedChecks::new([far_minute()]),
+        aligned_only: true,
+        ..fast_config()
+    };
+    let (watcher, mut rx) = Watcher::spawn(fake.clone(), config);
+    watcher.set_targets(vec![target("R683", "MG724CH/A")]).await;
+    watcher.start().await;
+    wait_cycle(&mut rx).await;
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+    assert!(watcher.query_now().await, "运行中应接受立即查询");
+    let (next, _, aligned) = next_check(
+        &tokio::time::timeout(Duration::from_millis(150), wait_cycle(&mut rx))
+            .await
+            .expect("立即查询不该等到勾选的时刻"),
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fake.retries.load(Ordering::SeqCst),
+        0,
+        "立即查询不该清除保护冷却"
+    );
+    assert!(
+        next > 60 && aligned,
+        "查完之后仍等到勾选的时刻：{next} 秒后"
+    );
+
+    watcher.stop().await;
+    assert!(!watcher.query_now().await, "暂停后不应擅自启动监控");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
 }

@@ -17,6 +17,8 @@ rand.workspace = true
 rodio.workspace = true
 dirs.workspace = true
 dom_query = "0.27"
+# 定点查询要按本机时区算整点和半点；应用依赖树里本来就有它。
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

@@ -15,9 +15,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
+  BlockedRoute,
   CatalogRefresh,
   Category,
   CategoryOption,
+  CheckoutSignIn,
   ClashRouteCheck,
   ClashSettings,
   DeliveryLocalities,
@@ -37,12 +39,14 @@ import type {
 import { assertNever, targetKey } from "./types";
 import { describeBrowserFailure, describeCycleRows, describeCycleSummary } from "./monitorLog";
 import { endSession, joinSession, recordCycle, startSession, type MonitorSession } from "./monitorSession";
+import { describeMark, formatWait } from "./runStatus";
 
 import { describeUpdateError, type UpdateProgress } from "./updateStatus";
 
 const EVENT_CHANNEL = "watcher://event";
 const NOTICE_CHANNEL = "watcher://notice";
 const SETTINGS_CHANNEL = "watcher://settings";
+const CHECKOUT_SIGN_IN_CHANNEL = "checkout://sign-in";
 const MAX_LOG_LINES = 300;
 
 export interface UiState {
@@ -56,8 +60,14 @@ export interface UiState {
   session: MonitorSession | null;
   /** 当前目标地区中是否仍有 Apple 请求保护冷却。 */
   cooling: boolean;
+  /** 下一次是整点或半点的定点查询，等待比查询间隔短。 */
+  alignedCheck: boolean;
   /** 最近一轮实际使用的出口线路；跟随系统代理或尚未查询时为 null。 */
   route: string | null;
+  /** 仍被 Apple 拒绝的出口和起始时间；拿到正常响应后为 null。 */
+  blocked: BlockedRoute | null;
+  /** 最近一次确认下单浏览器里 Apple 账户登录状态的结果；还没确认过为 null。 */
+  checkoutSignIn: CheckoutSignIn | null;
   /** 非 null 表示「当前的状态不可信」，界面要挂一条持续可见的告警。 */
   trouble: Trouble | null;
   logs: string[];
@@ -91,6 +101,8 @@ const DEFAULT_SETTINGS: Settings = {
   targets: [],
   deliveryRegion: null,
   intervalSeconds: 30,
+  alignedChecks: [0, 30],
+  alignedOnly: false,
   barkUrl: "",
   productBarkUrls: {},
   barkOptions: {
@@ -140,7 +152,10 @@ let state: UiState = {
   countdownTotalMs: null,
   session: null,
   cooling: false,
+  alignedCheck: false,
   route: null,
+  blocked: null,
+  checkoutSignIn: null,
   trouble: null,
   logs: [],
   regions: [],
@@ -228,7 +243,7 @@ function applyEvent(event: WatcherEvent): void {
       break;
 
     case "cycleStarted":
-      update({ nextCheckAtMs: null, countdownTotalMs: null, cooling: false });
+      update({ nextCheckAtMs: null, countdownTotalMs: null, cooling: false, alignedCheck: false });
       pushLog(
         `第 ${event.cycle} 轮开始查询：${event.storeCount} 家门店、${event.targetCount} 项监控。${event.cycle === 1 ? "首次使用时会先建立 Apple 查询会话，通常需要几秒。" : ""}`,
       );
@@ -243,7 +258,9 @@ function applyEvent(event: WatcherEvent): void {
         countdownTotalMs: event.nextCheckInSecs * 1_000,
         session: recordCycle(state.session, event),
         cooling: event.cooling,
+        alignedCheck: event.alignedCheck,
         route: event.route ?? null,
+        blocked: event.blocked ?? null,
         // 只有引擎明说本轮健康，才收起告警。用「所有行都没错误」去反推是
         // 不可靠的：某些故障路径下状态压根没被更新。
         trouble: event.healthy ? null : state.trouble,
@@ -257,8 +274,9 @@ function applyEvent(event: WatcherEvent): void {
         `第 ${event.cycle} 轮完成（${formatElapsed(event.elapsedMs)}，实际请求 ${event.requestCount} 次` +
         `${event.reusedResponseCount > 0 ? `，批量响应覆盖 ${event.reusedResponseCount} 家门店` : ""}` +
         `${event.route ? `，线路：${event.route}` : ""}）：` +
-        `${describeCycleSummary(event.snapshot)}。约 ${event.nextCheckInSecs} 秒后查询` +
-        `${event.cooling ? "（当前保护冷却中，可选择立即重试）" : ""}。`,
+        `${describeCycleSummary(event.snapshot)}。约 ${formatWait(event.nextCheckInSecs)}后查询` +
+        `${event.alignedCheck ? `（${describeMark(Date.now() + event.nextCheckInSecs * 1_000)}）` : ""}` +
+        `${event.cooling ? "（当前保护冷却中，点「立即重试」可清除）" : ""}。`,
       );
       pushLogs(lines);
       break;
@@ -276,6 +294,7 @@ function applyEvent(event: WatcherEvent): void {
           nextCheckAtMs: event.running ? state.nextCheckAtMs : null,
           countdownTotalMs: event.running ? state.countdownTotalMs : null,
           cooling: event.running ? state.cooling : false,
+          alignedCheck: event.running ? state.alignedCheck : false,
         });
         pushLog(event.running ? "已开始监控。" : "已暂停监控。");
       }
@@ -305,6 +324,7 @@ export function connect(): Promise<void> {
       // 后端自己改了设置（结账完成后关闭自动结账）时同步过来，否则界面上的开关
       // 还显示开启，下一次保存会把它重新打开。
       listen<Settings>(SETTINGS_CHANNEL, (e) => update({ settings: e.payload })),
+      listen<CheckoutSignIn>(CHECKOUT_SIGN_IN_CHANNEL, (e) => update({ checkoutSignIn: e.payload })),
     ]);
 
     const [regions, categories, settings, rows, running] = await Promise.all([
@@ -519,12 +539,28 @@ export async function retryWatchingNow(): Promise<boolean> {
     const accepted = await invoke<boolean>("retry_watching_now");
     if (accepted) {
       update({ nextCheckAtMs: null, countdownTotalMs: null, cooling: false });
-      pushLog("已按你的选择立即重新查询。");
+      pushLog("已清除冷却保护，立即重新查询。仍被 Apple 拒绝时，要再连续被拒 3 轮才会重新放慢。");
       return true;
     }
     pushLog("监控当前未运行，无法立即重试。");
   } catch (err) {
     pushLog(`立即重试失败：${String(err)}`);
+  }
+  return false;
+}
+
+/** 只做定点查询时不等下一个勾选的时刻，马上查一轮；不清除保护冷却。 */
+export async function queryNow(): Promise<boolean> {
+  try {
+    const accepted = await invoke<boolean>("query_now");
+    if (accepted) {
+      update({ nextCheckAtMs: null, countdownTotalMs: null });
+      pushLog("立即查询一轮，之后仍只在勾选的时刻查询。");
+      return true;
+    }
+    pushLog("监控当前未运行，无法立即查询。");
+  } catch (err) {
+    pushLog(`立即查询失败：${String(err)}`);
   }
   return false;
 }
@@ -619,6 +655,32 @@ export async function openCheckoutBrowser(): Promise<void> {
     pushLog("已打开下单浏览器。请在里面登录 Apple 账户，把要买的商品加入购物袋，并手动走一次结账。");
   } catch (err) {
     pushLog(`打开下单浏览器失败：${String(err)}`);
+  }
+}
+
+/**
+ * 在下单浏览器里登录 Apple 账户：保存了登录信息时自动填写并提交，否则打开登录页交给用户。
+ * 登录成功后登录状态经 checkout://sign-in 推过来，提醒随之收起。
+ */
+export async function signInCheckoutBrowser(): Promise<void> {
+  try {
+    pushLog(await invoke<string>("sign_in_checkout_browser"));
+  } catch (err) {
+    pushLog(`下单浏览器登录没有完成：${String(err)}`);
+  }
+}
+
+/**
+ * 立即确认下单浏览器里的 Apple 账户是否已登录。
+ *
+ * 结果经 checkout://sign-in 推过来更新界面，登录状态有变化时后端也会写一行日志，
+ * 这里只记下没能检查的原因，免得同一件事记两遍。
+ */
+export async function recheckCheckoutSignIn(): Promise<void> {
+  try {
+    await invoke<boolean>("check_checkout_sign_in");
+  } catch (err) {
+    pushLog(`没能确认下单浏览器的登录状态：${String(err)}`);
   }
 }
 

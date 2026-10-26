@@ -27,6 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use chrono::{NaiveTime, Timelike};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{DeliveryRegion, REGIONS, Target, region_by_locale};
@@ -85,6 +86,138 @@ pub const DEFAULT_INTERVAL_SECONDS: u64 = 30;
 
 /// 允许设置的间隔下限（秒）。频率交给用户决定，只排除 0 秒的无间隔连发。
 pub const MIN_INTERVAL_SECONDS: u64 = 1;
+
+/// 定点查询：每小时的哪几分钟立即查一轮，例如 `[0, 15, 30, 45]`。
+///
+/// 按固定间隔查询时，整点这样的时刻可能刚好落在两轮之间，最晚要等一整个间隔
+/// 才查到。勾选的每个时刻一到就立即查一轮，不等间隔走完；为空表示关闭。
+/// 默认整点和半点。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct AlignedChecks(Vec<u8>);
+
+impl Default for AlignedChecks {
+    fn default() -> Self {
+        Self::new([0, 30])
+    }
+}
+
+/// 反序列化同时接受旧版的文字取值：`half_hourly` 是整点和半点，`hourly` 是整点，
+/// `off` 是关闭。这样用旧版保存过的设置文件照样能读，不会因为字段类型变了被当成损坏。
+impl<'de> Deserialize<'de> for AlignedChecks {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Minutes(Vec<i64>),
+            Legacy(String),
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Minutes(minutes) => Self::new(
+                minutes
+                    .into_iter()
+                    .filter_map(|minute| u8::try_from(minute).ok()),
+            ),
+            Wire::Legacy(value) => match value.as_str() {
+                "off" => Self::off(),
+                "hourly" => Self::new([0]),
+                _ => Self::default(),
+            },
+        })
+    }
+}
+
+/// 定点时刻落在刚结束的这一轮里多少以内不算「错过」。
+///
+/// 由定点时刻唤醒的那一轮，开始时间只比时刻晚几毫秒；墙上时钟和单调时钟之间的
+/// 微小偏差不能让它被误判成错过，平白多查一轮。
+const MARK_TOLERANCE: Duration = Duration::from_millis(250);
+
+const HOUR_NANOS: u64 = 3_600_000_000_000;
+
+impl AlignedChecks {
+    /// 按分钟建立；超出 0～59 的值丢掉，重复的只留一个，按先后排好。
+    pub fn new(minutes: impl IntoIterator<Item = u8>) -> Self {
+        let mut minutes: Vec<u8> = minutes.into_iter().filter(|minute| *minute < 60).collect();
+        minutes.sort_unstable();
+        minutes.dedup();
+        Self(minutes)
+    }
+
+    /// 关闭定点查询，只按查询间隔。
+    pub fn off() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn minutes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// 按当前时刻调整下一轮的等待。
+    ///
+    /// `normal` 是按查询间隔应当等待的时长，`round` 是刚结束这一轮用的时间。
+    /// 下一个定点时刻比普通间隔先到时，等到那一刻；`only` 为 `true`（只做定点查询）
+    /// 时不看普通间隔，一律等到下一个定点时刻。上一个定点时刻落在这一轮查询过程中
+    /// 时，这一轮的请求可能在那一刻之前已经发出，立即再查一轮。没有勾选任何时刻时
+    /// 按普通间隔。返回实际等待和这次是不是定点查询。
+    pub fn next_delay(
+        &self,
+        normal: Duration,
+        round: Duration,
+        now: NaiveTime,
+        only: bool,
+    ) -> (Duration, bool) {
+        if self.0.is_empty() {
+            return (normal, false);
+        }
+        let into_hour = into_hour(now);
+        let (mut since_last, mut until_next) = (u64::MAX, u64::MAX);
+        for &minute in &self.0 {
+            let mark = u64::from(minute) * 60 * 1_000_000_000;
+            since_last = since_last.min((into_hour + HOUR_NANOS - mark) % HOUR_NANOS);
+            // 恰好在这一刻时，下一次是一小时之后。
+            let until = (mark + HOUR_NANOS - into_hour) % HOUR_NANOS;
+            until_next = until_next.min(if until == 0 { HOUR_NANOS } else { until });
+        }
+        let since_last = Duration::from_nanos(since_last);
+        let until_next = Duration::from_nanos(until_next);
+        if since_last + MARK_TOLERANCE <= round {
+            (Duration::ZERO, true)
+        } else if only || until_next < normal {
+            (until_next, true)
+        } else {
+            (normal, false)
+        }
+    }
+
+    /// 从 `now` 起要等多久，才到不早于 `earliest` 的第一个定点时刻。
+    ///
+    /// 只做定点查询时用：保护冷却比下一个定点时刻还长，冷却结束后也要等到定点时刻
+    /// 才查；等待中改了定点时刻，按新的时刻重新算。没有勾选任何时刻时就等 `earliest`。
+    pub fn first_mark_from(&self, now: NaiveTime, earliest: Duration) -> Duration {
+        let start =
+            ((u128::from(into_hour(now)) + earliest.as_nanos()) % u128::from(HOUR_NANOS)) as u64;
+        let until = self
+            .0
+            .iter()
+            .map(|&minute| {
+                (u64::from(minute) * 60 * 1_000_000_000 + HOUR_NANOS - start) % HOUR_NANOS
+            })
+            .min()
+            .unwrap_or(0);
+        earliest.saturating_add(Duration::from_nanos(until))
+    }
+}
+
+/// 当前时刻在这一小时里走过的纳秒数。
+fn into_hour(now: NaiveTime) -> u64 {
+    (u64::from(now.minute()) * 60 + u64::from(now.second())) * 1_000_000_000
+        + u64::from(now.nanosecond() % 1_000_000_000)
+}
 
 /// 读取设置文件时接受的字节上限。
 ///
@@ -424,6 +557,10 @@ pub struct Settings {
     pub delivery_region: Option<DeliveryRegion>,
     /// 每轮查询之间的间隔秒数。
     pub interval_seconds: u64,
+    /// 定点查询：每小时的哪几分钟立即查一轮，不等间隔走完。
+    pub aligned_checks: AlignedChecks,
+    /// 只做定点查询：不按查询间隔查询，只在勾选的时刻查。没有勾选任何时刻时不生效。
+    pub aligned_only: bool,
     /// 为空表示不启用 Bark 推送。
     pub bark_url: String,
     /// 按商品零件号覆盖默认 Bark；同一型号在不同门店共用一条路由。
@@ -458,6 +595,8 @@ impl Default for Settings {
             targets: Vec::new(),
             delivery_region: None,
             interval_seconds: DEFAULT_INTERVAL_SECONDS,
+            aligned_checks: AlignedChecks::default(),
+            aligned_only: false,
             bark_url: String::new(),
             product_bark_urls: BTreeMap::new(),
             bark_options: BarkOptions::default(),
@@ -998,6 +1137,8 @@ impl LegacySettings {
                 .interval_seconds
                 .and_then(|v| u64::try_from(v).ok())
                 .unwrap_or(fallback.interval_seconds),
+            aligned_checks: fallback.aligned_checks,
+            aligned_only: fallback.aligned_only,
             bark_url: self.bark_url.unwrap_or(fallback.bark_url),
             product_bark_urls: BTreeMap::new(),
             bark_options: fallback.bark_options,

@@ -27,6 +27,9 @@ use crate::chromium_fetcher::{ChromiumSession, app_profile_dir};
 
 const PROFILE_DIR: &str = "checkout-profile-v1";
 const BAG_URL: &str = "https://www.apple.com.cn/shop/bag";
+/// 账户页。没有登录时 Apple 会把它重定向到 `secure*.www.apple.com.cn/shop/signIn/account`，
+/// 预热据此判断下单浏览器里的 Apple 账户是否还在登录。
+const ACCOUNT_URL: &str = "https://www.apple.com.cn/shop/account/home";
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
 // Apple 的结账接口实测每次要 9 到 17 秒才返回，超时必须明显长于这个数，
 // 否则会在请求还没回来时重复点击，反而更慢。
@@ -37,6 +40,11 @@ const SLOT_TIMEOUT: Duration = Duration::from_secs(8);
 /// 门店页的状态连续这么久没有变化，才认为异步加载结束了。
 const SETTLE_WINDOW: Duration = Duration::from_millis(1200);
 const ORDER_TIMEOUT: Duration = Duration::from_secs(45);
+/// 预热等新页面的上限。比结账流程短：预热没做完只是少一次准备，到货时照常结账。
+const WARM_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(20);
+/// 到货结账等下单浏览器空出来的上限。预热在每一步之前都会检查有没有结账在等，
+/// 正常一两秒内就会让出；等满还拿不到，说明是另一次结账或试跑正在用。
+const CHECKOUT_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 /// 结账流程停下时所在的页面。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -563,6 +571,8 @@ fn trusted_checkout_login_url(value: &str) -> bool {
         && url.port().is_none()
         && secure_number.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
         && (url.path() == "/shop/signIn"
+            // 没登录时账户页重定向到这里，「登录」按钮在这里填写保存的账户。
+            || url.path() == "/shop/signIn/account"
             || (url.path() == "/shop/checkout"
                 && url
                     .query_pairs()
@@ -586,15 +596,7 @@ impl Flow<'_> {
     }
 
     async fn read<T: DeserializeOwned>(&mut self, script: &str) -> Result<T, String> {
-        let value = self
-            .session
-            .evaluate(script, false)
-            .await
-            .map_err(|e| e.to_string())?;
-        let raw = value
-            .as_str()
-            .ok_or_else(|| "页面脚本没有返回结果".to_string())?;
-        serde_json::from_str(raw).map_err(|e| format!("页面返回的数据无法解析：{e}"))
+        read_json(self.session, script).await
     }
 
     /// 反复读取页面状态直到满足条件。
@@ -716,150 +718,199 @@ impl Flow<'_> {
     }
 
     async fn sign_in(&mut self) -> Result<(), CheckoutError> {
-        let fail = |message| CheckoutError::new(Stage::SignIn, message);
         let login = crate::checkout_login::load()
-            .map_err(fail)?
+            .map_err(|message| CheckoutError::new(Stage::SignIn, message))?
             .ok_or_else(|| {
-                fail(
-                    "Apple 要求登录，请在自动结账设置中保存登录信息，或在下单浏览器中手动登录"
-                        .into(),
+                CheckoutError::new(
+                    Stage::SignIn,
+                    "Apple 要求登录，请在自动结账设置中保存登录信息，或在下单浏览器中手动登录",
                 )
             })?;
         self.report("自动结账：Apple 要求重新登录，正在使用软件配置中的账户登录");
-        let deadline = Instant::now() + Duration::from_secs(90);
-        let mut account_sent = false;
-        let mut password_sent = false;
-        while Instant::now() < deadline {
-            let state = self.read::<PageState>(PAGE_STATE_JS).await;
-            if state
-                .as_ref()
-                .is_ok_and(|s| !s.sign_in && s.step.starts_with("Fulfillment"))
-            {
-                self.report("自动结账：Apple 登录成功，继续本次结账");
-                return Ok(());
-            }
-            if let Some(context) = self.login_context().await? {
-                let status = self
-                    .login_action(context, &login.account, "", "inspect")
-                    .await?;
-                let action = match status.as_str() {
-                    "account" if !account_sent && !password_sent => Some("account"),
-                    "password" if !password_sent => Some("password"),
-                    "verification" => {
-                        return Err(fail(
-                            "Apple 要求验证码或二次验证，已保留页面，请手动完成验证".into(),
-                        ));
-                    }
-                    "error" => {
-                        return Err(fail(
-                            "Apple 登录未通过，已保留页面，请检查账户或密码；不会重复尝试密码"
-                                .into(),
-                        ));
-                    }
-                    "accountMismatch" => {
-                        return Err(fail(
-                            "登录页账户与配置账户不一致，未填写密码，请手动确认".into(),
-                        ));
-                    }
-                    "untrusted" => return Err(fail("登录页面来源不符合预期，未填写密码".into())),
-                    _ => None,
-                };
-                if let Some(action) = action {
-                    let status = self
-                        .login_action(
-                            context,
-                            &login.account,
-                            if action == "password" {
-                                &login.password
-                            } else {
-                                ""
-                            },
-                            action,
-                        )
-                        .await?;
-                    account_sent |= status == "accountSubmitted";
-                    password_sent |= status == "passwordSubmitted";
+        sign_in_with(self.session, &login, SignInGoal::Checkout).await?;
+        self.report("自动结账：Apple 登录成功，继续本次结账");
+        Ok(())
+    }
+}
+
+/// 登录完成后页面应当到达哪里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignInGoal {
+    /// 结账时要求登录：登录后回到取货方式页，继续本次结账。
+    Checkout,
+    /// 用户在提醒里点「登录」：登录后进入账户页。
+    Account,
+}
+
+impl SignInGoal {
+    async fn reached(self, session: &mut ChromiumSession) -> bool {
+        match self {
+            Self::Checkout => read_json::<PageState>(session, PAGE_STATE_JS)
+                .await
+                .is_ok_and(|s| !s.sign_in && s.step.starts_with("Fulfillment")),
+            Self::Account => read_location(session)
+                .await
+                .is_some_and(|location| location.ready && location.signed_in() == Some(true)),
+        }
+    }
+
+    fn timeout_message(self) -> &'static str {
+        match self {
+            Self::Checkout => "等待 Apple 登录完成超时，将清理购物袋后等待下次到货重试",
+            Self::Account => "等待 Apple 登录完成超时，已保留登录页",
+        }
+    }
+}
+
+/// 读取页面脚本返回的 JSON 字符串。
+async fn read_json<T: DeserializeOwned>(
+    session: &mut ChromiumSession,
+    script: &str,
+) -> Result<T, String> {
+    let value = session
+        .evaluate(script, false)
+        .await
+        .map_err(|e| e.to_string())?;
+    let raw = value
+        .as_str()
+        .ok_or_else(|| "页面脚本没有返回结果".to_string())?;
+    serde_json::from_str(raw).map_err(|e| format!("页面返回的数据无法解析：{e}"))
+}
+
+/// 用保存的账户在 Apple 官方登录框里登录。
+///
+/// 账户和密码各只提交一次；遇到验证码、二次验证、登录报错或账户不一致时立即停下，
+/// 页面留给用户处理，不会重复尝试密码。
+async fn sign_in_with(
+    session: &mut ChromiumSession,
+    login: &crate::checkout_login::Login,
+    goal: SignInGoal,
+) -> Result<(), CheckoutError> {
+    let fail = |message: &str| CheckoutError::new(Stage::SignIn, message);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut account_sent = false;
+    let mut password_sent = false;
+    while Instant::now() < deadline {
+        if goal.reached(session).await {
+            return Ok(());
+        }
+        if let Some(context) = login_context(session).await? {
+            let status = login_action(session, context, &login.account, "", "inspect").await?;
+            let action = match status.as_str() {
+                "account" if !account_sent && !password_sent => Some("account"),
+                "password" if !password_sent => Some("password"),
+                "verification" => {
+                    return Err(fail(
+                        "Apple 要求验证码或二次验证，已保留页面，请手动完成验证",
+                    ));
                 }
+                "error" => {
+                    return Err(fail(
+                        "Apple 登录未通过，已保留页面，请检查账户或密码；不会重复尝试密码",
+                    ));
+                }
+                "accountMismatch" => {
+                    return Err(fail("登录页账户与配置账户不一致，未填写密码，请手动确认"));
+                }
+                "untrusted" => return Err(fail("登录页面来源不符合预期，未填写密码")),
+                _ => None,
+            };
+            if let Some(action) = action {
+                let status = login_action(
+                    session,
+                    context,
+                    &login.account,
+                    if action == "password" {
+                        &login.password
+                    } else {
+                        ""
+                    },
+                    action,
+                )
+                .await?;
+                account_sent |= status == "accountSubmitted";
+                password_sent |= status == "passwordSubmitted";
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        Err(CheckoutError::new(
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Err(CheckoutError::new(
+        Stage::SignInLoading,
+        goal.timeout_message(),
+    ))
+}
+
+/// Apple 官方登录框所在 iframe 的执行上下文；顶层页面不是可信的登录入口时为 `None`。
+async fn login_context(session: &mut ChromiumSession) -> Result<Option<u64>, CheckoutError> {
+    let fail = || CheckoutError::new(Stage::SignInLoading, "暂时无法读取 Apple 登录页面");
+    let tree = session
+        .command("Page.getFrameTree", json!({}))
+        .await
+        .map_err(|_| fail())?;
+    let Some(tree) = tree.get("frameTree") else {
+        return Ok(None);
+    };
+    let top = tree
+        .pointer("/frame/url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !trusted_checkout_login_url(top) {
+        return Ok(None);
+    }
+    let frame = tree
+        .get("childFrames")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .find(|child| {
+            child
+                .pointer("/frame/securityOrigin")
+                .and_then(|v| v.as_str())
+                == Some("https://idmsa.apple.com.cn")
+        });
+    let Some(frame_id) = frame
+        .and_then(|f| f.pointer("/frame/id"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(None);
+    };
+    let world = session
+        .command(
+            "Page.createIsolatedWorld",
+            json!({"frameId":frame_id,"worldName":"apw-checkout-login"}),
+        )
+        .await
+        .map_err(|_| fail())?;
+    Ok(world.get("executionContextId").and_then(|v| v.as_u64()))
+}
+
+async fn login_action(
+    session: &mut ChromiumSession,
+    context: u64,
+    account: &str,
+    password: &str,
+    action: &str,
+) -> Result<String, CheckoutError> {
+    let result = session.command("Runtime.callFunctionOn", json!({
+        "executionContextId":context,
+        "functionDeclaration":format!("function(expected, action) {{ return ({})(expected, action); }}", include_str!("checkout_sign_in.js")),
+        "arguments":[{"value":{"account":account,"password":password}},{"value":action}],
+        "returnByValue":true,
+    })).await.map_err(|_| CheckoutError::new(Stage::SignInLoading, "登录页面发生变化，将重新确认页面状态"))?;
+    if result.get("exceptionDetails").is_some() {
+        return Err(CheckoutError::new(
             Stage::SignInLoading,
-            "等待 Apple 登录完成超时，将清理购物袋后等待下次到货重试",
-        ))
+            "登录控件暂时无法操作",
+        ));
     }
+    Ok(result
+        .pointer("/result/value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("waiting")
+        .to_owned())
+}
 
-    async fn login_context(&mut self) -> Result<Option<u64>, CheckoutError> {
-        let fail = || CheckoutError::new(Stage::SignInLoading, "暂时无法读取 Apple 登录页面");
-        let tree = self
-            .session
-            .command("Page.getFrameTree", json!({}))
-            .await
-            .map_err(|_| fail())?;
-        let Some(tree) = tree.get("frameTree") else {
-            return Ok(None);
-        };
-        let top = tree
-            .pointer("/frame/url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if !trusted_checkout_login_url(top) {
-            return Ok(None);
-        }
-        let frame = tree
-            .get("childFrames")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .find(|child| {
-                child
-                    .pointer("/frame/securityOrigin")
-                    .and_then(|v| v.as_str())
-                    == Some("https://idmsa.apple.com.cn")
-            });
-        let Some(frame_id) = frame
-            .and_then(|f| f.pointer("/frame/id"))
-            .and_then(|v| v.as_str())
-        else {
-            return Ok(None);
-        };
-        let world = self
-            .session
-            .command(
-                "Page.createIsolatedWorld",
-                json!({"frameId":frame_id,"worldName":"apw-checkout-login"}),
-            )
-            .await
-            .map_err(|_| fail())?;
-        Ok(world.get("executionContextId").and_then(|v| v.as_u64()))
-    }
-
-    async fn login_action(
-        &mut self,
-        context: u64,
-        account: &str,
-        password: &str,
-        action: &str,
-    ) -> Result<String, CheckoutError> {
-        let result = self.session.command("Runtime.callFunctionOn", json!({
-            "executionContextId":context,
-            "functionDeclaration":format!("function(expected, action) {{ return ({})(expected, action); }}", include_str!("checkout_sign_in.js")),
-            "arguments":[{"value":{"account":account,"password":password}},{"value":action}],
-            "returnByValue":true,
-        })).await.map_err(|_| CheckoutError::new(Stage::SignInLoading, "登录页面发生变化，将重新确认页面状态"))?;
-        if result.get("exceptionDetails").is_some() {
-            return Err(CheckoutError::new(
-                Stage::SignInLoading,
-                "登录控件暂时无法操作",
-            ));
-        }
-        Ok(result
-            .pointer("/result/value")
-            .and_then(|v| v.as_str())
-            .unwrap_or("waiting")
-            .to_owned())
-    }
-
+impl Flow<'_> {
     async fn navigate(&mut self, url: &str, stage: Stage) -> Result<(), CheckoutError> {
         if self.plan.auto_add_to_bag {
             self.session
@@ -1776,6 +1827,144 @@ impl Flow<'_> {
     }
 }
 
+/// 预热时页面所在的位置。
+#[derive(Debug, Deserialize)]
+struct PageLocation {
+    /// 已经换成导航后的新文档，并且解析完成。
+    ready: bool,
+    blank: bool,
+    host: String,
+    path: String,
+}
+
+const PAGE_LOCATION_JS: &str = r#"JSON.stringify({
+  ready: !window.__apwWarmNavigating && document.readyState !== 'loading',
+  blank: location.href === 'about:blank',
+  host: location.host,
+  path: location.pathname,
+})"#;
+
+fn apple_cn_host(host: &str) -> bool {
+    host == "www.apple.com.cn" || host.ends_with(".www.apple.com.cn")
+}
+
+impl PageLocation {
+    /// 预热只动自己会停留的页面：空白页、购物袋和账户页。用户正在登录、结账或
+    /// 看别的页面时不打扰，等下一次检查。
+    fn idle(&self) -> bool {
+        self.blank
+            || (self.host == "www.apple.com.cn" && self.path == "/shop/bag")
+            || (apple_cn_host(&self.host) && self.path.starts_with("/shop/account"))
+    }
+
+    /// 打开账户页后落在哪里：登录页说明没有登录，账户页说明仍在登录，
+    /// 认不出的页面不下结论。
+    fn signed_in(&self) -> Option<bool> {
+        if self.host.starts_with("idmsa.") || self.path.to_ascii_lowercase().contains("signin") {
+            Some(false)
+        } else if apple_cn_host(&self.host) && self.path.starts_with("/shop/account") {
+            Some(true)
+        } else {
+            None
+        }
+    }
+}
+
+/// 一次预热的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Warmup {
+    /// 下单浏览器已停在购物袋。`signed_in` 是账户页显示的登录状态，没认出页面时为 `None`。
+    Ready {
+        opened: bool,
+        signed_in: Option<bool>,
+    },
+    /// 没有动页面：正在结账、等待验证码、有到货在等，或用户正在用这个窗口。
+    Skipped,
+    /// 下单浏览器没开着，这次也不负责打开。
+    Closed,
+}
+
+enum Settle {
+    /// 有结账在等这个窗口，预热立即放手。
+    Yield,
+    Failed(String),
+}
+
+/// 点「登录」的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInOutcome {
+    /// 用保存的账户登录成功，已回到购物袋。
+    SignedIn,
+    /// 打开账户页时已经是登录状态。
+    AlreadySignedIn,
+    /// 停在登录页交给用户：没有保存登录信息、需要验证码或二次验证、登录报错等。
+    NeedsUser(String),
+}
+
+async fn to_front(session: &mut ChromiumSession) -> Result<(), CheckoutError> {
+    session
+        .command("Page.bringToFront", json!({}))
+        .await
+        .map(|_| ())
+        .map_err(|e| CheckoutError::new(Stage::Browser, e.to_string()))
+}
+
+async fn read_location(session: &mut ChromiumSession) -> Option<PageLocation> {
+    let value = session.evaluate(PAGE_LOCATION_JS, false).await.ok()?;
+    serde_json::from_str(value.as_str()?).ok()
+}
+
+/// 导航到 `url` 并等到新文档，每一步之前都先看有没有结账在等。
+async fn settle(
+    session: &mut ChromiumSession,
+    url: &str,
+    yielding: &(dyn Fn() -> bool + Sync),
+) -> Result<PageLocation, Settle> {
+    if yielding() {
+        return Err(Settle::Yield);
+    }
+    // 先给旧文档做标记：标记消失才说明换成了新文档，不会把旧页面当成结果。
+    let _ = session
+        .evaluate("window.__apwWarmNavigating = true", false)
+        .await;
+    let navigation = session
+        .command("Page.navigate", json!({ "url": url }))
+        .await
+        .map_err(|e| Settle::Failed(e.to_string()))?;
+    if let Some(error) = navigation
+        .get("errorText")
+        .and_then(serde_json::Value::as_str)
+        .filter(|error| !error.trim().is_empty())
+    {
+        return Err(Settle::Failed(format!("页面打不开：{error}")));
+    }
+    let deadline = Instant::now() + WARM_NAVIGATION_TIMEOUT;
+    loop {
+        if yielding() {
+            return Err(Settle::Yield);
+        }
+        if let Some(location) = read_location(session).await
+            && location.ready
+        {
+            return Ok(location);
+        }
+        if Instant::now() >= deadline {
+            return Err(Settle::Failed("等待页面加载超时".into()));
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// 离开作用域时放下预热标记。要在会话锁之前声明，保证先放锁、后放标记：
+/// 中间要是先放了标记，到货时会把还没放开的锁当成正在结账而跳过这次到货。
+struct WarmingFlag<'a>(&'a AtomicBool);
+
+impl Drop for WarmingFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// 下单浏览器会话的持有者。同一时间只运行一次结账。
 #[derive(Clone, Default)]
 pub struct CheckoutRunner {
@@ -1785,6 +1974,10 @@ pub struct CheckoutRunner {
     cleanup_pending: Arc<AtomicBool>,
     /// 账户验证失败后只观察保留页面，不跨轮次重复提交密码。
     login_blocked: Arc<AtomicBool>,
+    /// 预热正占着下单浏览器。它随时会让出，不算正在结账。
+    warming: Arc<AtomicBool>,
+    /// 结账或用户操作正在等下单浏览器，预热要在下一步之前让出。
+    waiting: Arc<AtomicBool>,
 }
 
 /// 从到货事件分派直到结果写回设置都占住名额，避免多型号同时到货时排队下两单。
@@ -1805,11 +1998,165 @@ impl CheckoutRunner {
         if self.is_busy() {
             return None;
         }
-        let _session = self.session.try_lock().ok()?;
+        // 预热占着会话时照样接下这次到货：它看到有结账在等会立即让出。
+        let _session = if self.warming.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.session.try_lock().ok()?)
+        };
         self.reserved
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()?;
         Some(CheckoutReservation(self.reserved.clone()))
+    }
+
+    /// 拿下单浏览器来用。先告诉预热有人在等，它会在下一步之前让出；
+    /// `wait` 为 `None` 时一直等，否则等满还拿不到就放弃。
+    async fn claim(
+        &self,
+        wait: Option<Duration>,
+    ) -> Option<tokio::sync::MutexGuard<'_, Option<ChromiumSession>>> {
+        self.waiting.store(true, Ordering::Release);
+        let slot = match wait {
+            Some(wait) => tokio::time::timeout(wait, self.session.lock()).await.ok(),
+            None => Some(self.session.lock().await),
+        };
+        self.waiting.store(false, Ordering::Release);
+        slot
+    }
+
+    /// 有结账或用户操作在等下单浏览器。
+    fn wanted(&self) -> bool {
+        self.reserved.load(Ordering::Acquire) || self.waiting.load(Ordering::Acquire)
+    }
+
+    /// 在后台准备下单浏览器：确认 Apple 账户的登录状态，然后停在购物袋。
+    ///
+    /// `launch` 为 `true` 时（开始监控、结账失败关窗后）没开着就启动它，否则只在
+    /// 已经开着时检查。不把窗口带到前台，也不碰购物袋里的商品。到货结账要用这个
+    /// 窗口时，每一步之前都会立即让出。
+    pub async fn warm_up(&self, launch: bool) -> Result<Warmup, CheckoutError> {
+        if self.is_busy() || self.wanted() || self.login_blocked.load(Ordering::Acquire) {
+            return Ok(Warmup::Skipped);
+        }
+        // 同一时间只做一次预热。标记在拿会话之前立起，到货时据此知道会话马上会让出。
+        if self
+            .warming
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(Warmup::Skipped);
+        }
+        let _warming = WarmingFlag(&self.warming);
+        let Ok(mut slot) = self.session.try_lock() else {
+            return Ok(Warmup::Skipped);
+        };
+        let alive = match slot.as_mut() {
+            Some(session) => session.evaluate("1", false).await.is_ok(),
+            None => false,
+        };
+        if !alive && !launch {
+            // 用户关掉了窗口：释放旧进程，但不替用户重新打开。
+            *slot = None;
+            return Ok(Warmup::Closed);
+        }
+        let session = if alive {
+            let session = slot.as_mut().expect("刚确认过下单浏览器可用");
+            if !read_location(session)
+                .await
+                .is_some_and(|location| location.idle())
+            {
+                return Ok(Warmup::Skipped);
+            }
+            session
+        } else {
+            Self::ensure(&mut slot).await?
+        };
+        let yielding = || self.wanted();
+        let signed_in = match settle(session, ACCOUNT_URL, &yielding).await {
+            Ok(location) => location.signed_in(),
+            Err(Settle::Yield) => return Ok(Warmup::Skipped),
+            Err(Settle::Failed(_)) => None,
+        };
+        match settle(session, BAG_URL, &yielding).await {
+            Ok(_) => Ok(Warmup::Ready {
+                opened: !alive,
+                signed_in,
+            }),
+            Err(Settle::Yield) => Ok(Warmup::Skipped),
+            Err(Settle::Failed(message)) => Err(CheckoutError::new(Stage::Bag, message)),
+        }
+    }
+
+    /// 在下单浏览器里登录 Apple 账户。
+    ///
+    /// 打开账户页：已经登录就回到购物袋；被带到登录页时用保存的账户自动填写并提交，
+    /// 成功后回到购物袋。没有保存登录信息，或者 Apple 要求验证码、二次验证、登录报错
+    /// 时，停在登录页并带到前台，交给用户处理。
+    pub async fn sign_in(&self) -> Result<SignInOutcome, CheckoutError> {
+        self.sign_in_using(crate::checkout_login::load).await
+    }
+
+    async fn sign_in_using(
+        &self,
+        load_login: impl FnOnce() -> Result<Option<crate::checkout_login::Login>, String>,
+    ) -> Result<SignInOutcome, CheckoutError> {
+        let Some(mut slot) = self.claim(None).await else {
+            return Err(CheckoutError::new(Stage::Browser, "下单浏览器暂时不可用"));
+        };
+        let session = Self::ensure(&mut slot).await?;
+        if self.login_blocked.load(Ordering::Acquire) {
+            // 结账时停在了验证页：只带到前台，不导航、也不再提交密码。
+            to_front(session).await?;
+            return Ok(SignInOutcome::NeedsUser(
+                "下单浏览器正停在 Apple 的验证页面，请先完成验证".into(),
+            ));
+        }
+        let stay = || false;
+        let on_sign_in_page = session
+            .evaluate("location.href", false)
+            .await
+            .ok()
+            .and_then(|href| href.as_str().map(trusted_checkout_login_url))
+            .unwrap_or(false);
+        if !on_sign_in_page {
+            let location = settle(session, ACCOUNT_URL, &stay)
+                .await
+                .map_err(|failure| match failure {
+                    Settle::Failed(message) => CheckoutError::new(Stage::SignIn, message),
+                    Settle::Yield => CheckoutError::new(Stage::SignIn, "下单浏览器正在使用"),
+                })?;
+            match location.signed_in() {
+                Some(true) => {
+                    let _ = settle(session, BAG_URL, &stay).await;
+                    return Ok(SignInOutcome::AlreadySignedIn);
+                }
+                Some(false) => {}
+                None => {
+                    to_front(session).await?;
+                    return Ok(SignInOutcome::NeedsUser(
+                        "账户页没有跳到 Apple 登录页，请在下单浏览器里查看".into(),
+                    ));
+                }
+            }
+        }
+        to_front(session).await?;
+        let login = match load_login() {
+            Ok(Some(login)) => login,
+            Ok(None) => {
+                return Ok(SignInOutcome::NeedsUser(
+                    "没有保存登录信息，已打开 Apple 登录页".into(),
+                ));
+            }
+            Err(message) => return Ok(SignInOutcome::NeedsUser(message)),
+        };
+        match sign_in_with(session, &login, SignInGoal::Account).await {
+            Ok(()) => {
+                let _ = settle(session, BAG_URL, &stay).await;
+                Ok(SignInOutcome::SignedIn)
+            }
+            Err(error) => Ok(SignInOutcome::NeedsUser(error.message)),
+        }
     }
 
     /// 确保下单浏览器开着并且连接可用；用户关掉窗口后会重新启动。
@@ -1834,7 +2181,9 @@ impl CheckoutRunner {
 
     /// 打开下单浏览器并显示购物袋，供用户登录、加购和预热结账。
     pub async fn open(&self) -> Result<(), CheckoutError> {
-        let mut slot = self.session.lock().await;
+        let Some(mut slot) = self.claim(None).await else {
+            return Err(CheckoutError::new(Stage::Browser, "下单浏览器暂时不可用"));
+        };
         let session = Self::ensure(&mut slot).await?;
         let browser_error =
             |e: apw_core::apple::ApiError| CheckoutError::new(Stage::Browser, e.to_string());
@@ -1883,7 +2232,7 @@ impl CheckoutRunner {
                 "已有一次自动结账正在进行",
             ));
         }
-        let Ok(mut slot) = self.session.try_lock() else {
+        let Some(mut slot) = self.claim(Some(CHECKOUT_LOCK_WAIT)).await else {
             return Err(CheckoutError::new(
                 Stage::Browser,
                 "已有一次结账正在进行，本次到货没有重复触发",
@@ -1955,9 +2304,10 @@ impl CheckoutRunner {
         result
     }
 
-    /// 是否有一次结账正在进行。
+    /// 是否有一次结账正在进行。预热占着下单浏览器时不算：有到货时它会立即让出。
     pub fn is_busy(&self) -> bool {
-        self.reserved.load(Ordering::Acquire) || self.session.try_lock().is_err()
+        self.reserved.load(Ordering::Acquire)
+            || (!self.warming.load(Ordering::Acquire) && self.session.try_lock().is_err())
     }
 
     pub async fn shutdown(&self) {
@@ -1977,7 +2327,11 @@ mod tests {
         assert!(trusted_checkout_login_url(
             "https://secure12.www.apple.com.cn/shop/checkout?_s=SignIn"
         ));
+        assert!(trusted_checkout_login_url(
+            "https://secure7.www.apple.com.cn/shop/signIn/account?ssi=test"
+        ));
         for url in [
+            "https://secure7.www.apple.com.cn/shop/signIn/other",
             "http://secure6.www.apple.com.cn/shop/signIn",
             "https://secure6.www.apple.com.cn.example.test/shop/signIn",
             "https://secure.www.apple.com.cn/shop/signIn",
@@ -2331,6 +2685,347 @@ mod tests {
         assert!(runner.try_reserve().is_some());
     }
 
+    fn location(host: &str, path: &str) -> serde_json::Value {
+        cdp_page(json!({"ready": true, "blank": false, "host": host, "path": path}))
+    }
+
+    fn runner_with(session: ChromiumSession) -> CheckoutRunner {
+        CheckoutRunner {
+            session: Arc::new(Mutex::new(Some(session))),
+            ..Default::default()
+        }
+    }
+
+    const SIGN_IN_PAGE: &str = "https://secure7.www.apple.com.cn/shop/signIn/account?ssi=test";
+
+    fn sign_in_frames() -> serde_json::Value {
+        json!({"result": {"frameTree": {
+            "frame": {"id": "top", "url": SIGN_IN_PAGE},
+            "childFrames": [{"frame": {"id": "login", "securityOrigin": "https://idmsa.apple.com.cn"}}]
+        }}})
+    }
+
+    fn synthetic_login() -> Result<Option<crate::checkout_login::Login>, String> {
+        Ok(Some(crate::checkout_login::Login {
+            account: "test@example.test".into(),
+            password: "synthetic-password".into(),
+        }))
+    }
+
+    /// 打开账户页被带到登录页之前的几步：会话可用、当前不在登录页、导航到账户页。
+    fn reach_sign_in_page() -> Vec<serde_json::Value> {
+        vec![
+            json!({"result": {"result": {"value": 1}}}),
+            json!({"result": {"result": {"value": "https://www.apple.com.cn/shop/bag"}}}),
+            json!({"result": {"result": {}}}),
+            json!({"result": {"frameId": "page"}}),
+            location("secure7.www.apple.com.cn", "/shop/signIn/account"),
+        ]
+    }
+
+    fn login_calls(requests: &[serde_json::Value], action: &str) -> usize {
+        requests
+            .iter()
+            .filter(|r| {
+                r["method"] == "Runtime.callFunctionOn"
+                    && r["params"]["arguments"][1]["value"] == action
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn 点登录用保存的账户自动填写并只提交一次密码后回到购物袋() {
+        let mut responses = reach_sign_in_page();
+        responses.extend([
+            json!({"result": {}}), // 带到前台
+            location("secure7.www.apple.com.cn", "/shop/signIn/account"),
+            sign_in_frames(),
+            json!({"result": {"executionContextId": 7}}),
+            json!({"result": {"result": {"value": "password"}}}),
+            json!({"result": {"result": {"value": "passwordSubmitted"}}}),
+            location("www.apple.com.cn", "/shop/account/home"),
+            json!({"result": {"result": {}}}),
+            json!({"result": {"frameId": "page"}}),
+            location("www.apple.com.cn", "/shop/bag"),
+        ]);
+        let (session, _peer, requests) =
+            crate::chromium_fetcher::tests::checkout_session(responses).await;
+        let runner = runner_with(session);
+        assert_eq!(
+            runner.sign_in_using(synthetic_login).await.unwrap(),
+            SignInOutcome::SignedIn
+        );
+        let requests = requests.lock().await;
+        assert_eq!(login_calls(&requests, "password"), 1, "密码只提交一次");
+        let submitted = requests
+            .iter()
+            .find(|r| r["params"]["arguments"][1]["value"] == "password")
+            .unwrap();
+        assert_eq!(
+            submitted["params"]["arguments"][0]["value"]["password"],
+            "synthetic-password"
+        );
+        let urls: Vec<_> = requests
+            .iter()
+            .filter(|r| r["method"] == "Page.navigate")
+            .map(|r| r["params"]["url"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(urls, [ACCOUNT_URL, BAG_URL], "登录成功后回到购物袋");
+        drop(requests);
+        runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn 点登录遇到验证码时停在登录页且不提交密码() {
+        let mut responses = reach_sign_in_page();
+        responses.extend([
+            json!({"result": {}}),
+            location("secure7.www.apple.com.cn", "/shop/signIn/account"),
+            sign_in_frames(),
+            json!({"result": {"executionContextId": 7}}),
+            json!({"result": {"result": {"value": "verification"}}}),
+        ]);
+        let (session, _peer, requests) =
+            crate::chromium_fetcher::tests::checkout_session(responses).await;
+        let runner = runner_with(session);
+        let SignInOutcome::NeedsUser(reason) = runner.sign_in_using(synthetic_login).await.unwrap()
+        else {
+            panic!("需要验证码时应交给用户");
+        };
+        assert!(reason.contains("验证码"), "{reason}");
+        let requests = requests.lock().await;
+        assert_eq!(login_calls(&requests, "password"), 0);
+        assert!(
+            requests.iter().any(|r| r["method"] == "Page.bringToFront"),
+            "登录页要带到前台交给用户"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|r| r["params"]["url"].as_str() == Some(BAG_URL)),
+            "不能离开验证页"
+        );
+        drop(requests);
+        runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn 已经登录时直接回到购物袋_没有保存登录信息时只打开登录页() {
+        let mut responses = reach_sign_in_page();
+        responses.truncate(4);
+        responses.extend([
+            location("www.apple.com.cn", "/shop/account/home"),
+            json!({"result": {"result": {}}}),
+            json!({"result": {"frameId": "page"}}),
+            location("www.apple.com.cn", "/shop/bag"),
+        ]);
+        let (session, _peer, requests) =
+            crate::chromium_fetcher::tests::checkout_session(responses).await;
+        let runner = runner_with(session);
+        assert_eq!(
+            runner.sign_in_using(synthetic_login).await.unwrap(),
+            SignInOutcome::AlreadySignedIn
+        );
+        assert_eq!(login_calls(&requests.lock().await, "inspect"), 0);
+        runner.shutdown().await;
+
+        let mut responses = reach_sign_in_page();
+        responses.push(json!({"result": {}}));
+        let (session, _peer, requests) =
+            crate::chromium_fetcher::tests::checkout_session(responses).await;
+        let runner = runner_with(session);
+        let outcome = runner.sign_in_using(|| Ok(None)).await.unwrap();
+        assert!(
+            matches!(&outcome, SignInOutcome::NeedsUser(reason) if reason.contains("没有保存登录信息")),
+            "{outcome:?}"
+        );
+        assert_eq!(login_calls(&requests.lock().await, "inspect"), 0);
+        runner.shutdown().await;
+    }
+
+    #[test]
+    fn 预热只动自己停留的页面并按账户页落点判断登录() {
+        let at = |host: &str, path: &str| PageLocation {
+            ready: true,
+            blank: false,
+            host: host.into(),
+            path: path.into(),
+        };
+        assert!(at("www.apple.com.cn", "/shop/bag").idle());
+        assert!(at("secure7.www.apple.com.cn", "/shop/account/home").idle());
+        assert!(
+            PageLocation {
+                blank: true,
+                ..at("", "blank")
+            }
+            .idle()
+        );
+        for (host, path) in [
+            ("secure7.www.apple.com.cn", "/shop/signIn/account"),
+            ("secure7.www.apple.com.cn", "/shop/checkout"),
+            ("www.apple.com.cn", "/shop/buy-iphone/iphone-17"),
+            ("www.apple.com", "/shop/bag"),
+        ] {
+            assert!(!at(host, path).idle(), "{host}{path} 可能正被用户使用");
+        }
+
+        assert_eq!(
+            at("secure7.www.apple.com.cn", "/shop/signIn/account").signed_in(),
+            Some(false)
+        );
+        assert_eq!(
+            at("idmsa.apple.com.cn", "/appleauth/auth/signin").signed_in(),
+            Some(false)
+        );
+        assert_eq!(
+            at("www.apple.com.cn", "/shop/account/home").signed_in(),
+            Some(true)
+        );
+        assert_eq!(at("www.apple.com.cn", "/shop/bag").signed_in(), None);
+    }
+
+    #[tokio::test]
+    async fn 预热打开账户页确认登录后停回购物袋且不带到前台不碰购物袋() {
+        for (landing, expected) in [
+            (
+                location("secure7.www.apple.com.cn", "/shop/signIn/account"),
+                Some(false),
+            ),
+            (
+                location("www.apple.com.cn", "/shop/account/home"),
+                Some(true),
+            ),
+            (location("www.apple.com.cn", "/shop/help"), None),
+        ] {
+            let navigate = json!({"result": {"frameId": "page"}});
+            let marked = json!({"result": {"result": {}}});
+            let (session, _peer, requests) =
+                crate::chromium_fetcher::tests::checkout_session(vec![
+                    json!({"result": {"result": {"value": 1}}}), // 会话可用
+                    location("www.apple.com.cn", "/shop/bag"),   // 停在购物袋，可以动
+                    marked.clone(),
+                    navigate.clone(),
+                    landing,
+                    marked,
+                    navigate,
+                    location("www.apple.com.cn", "/shop/bag"),
+                ])
+                .await;
+            let runner = runner_with(session);
+            assert_eq!(
+                runner.warm_up(false).await.unwrap(),
+                Warmup::Ready {
+                    opened: false,
+                    signed_in: expected,
+                }
+            );
+            let requests = requests.lock().await;
+            let urls: Vec<_> = requests
+                .iter()
+                .filter(|r| r["method"] == "Page.navigate")
+                .map(|r| r["params"]["url"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(urls, [ACCOUNT_URL, BAG_URL]);
+            assert!(
+                requests.iter().all(|r| r["method"] != "Page.bringToFront"
+                    && r["method"] != "Input.dispatchMouseEvent"),
+                "预热不能抢前台，也不能点页面"
+            );
+            assert!(
+                !requests
+                    .iter()
+                    .filter_map(|r| r["params"]["expression"].as_str())
+                    .any(|script| script.contains(".click()")),
+                "预热不能点任何按钮"
+            );
+            assert!(!runner.is_busy());
+            drop(requests);
+            runner.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn 用户正在用下单浏览器时预热不动页面() {
+        let (session, _peer, requests) = crate::chromium_fetcher::tests::checkout_session(vec![
+            json!({"result": {"result": {"value": 1}}}),
+            location("secure7.www.apple.com.cn", "/shop/signIn/account"),
+        ])
+        .await;
+        let runner = runner_with(session);
+        assert_eq!(runner.warm_up(true).await.unwrap(), Warmup::Skipped);
+        assert!(
+            requests
+                .lock()
+                .await
+                .iter()
+                .all(|r| r["method"] != "Page.navigate"),
+            "用户正在登录时不能把页面带走"
+        );
+
+        runner.login_blocked.store(true, Ordering::Release);
+        assert_eq!(runner.warm_up(true).await.unwrap(), Warmup::Skipped);
+        runner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn 用户关掉窗口后定时检查不替用户重新打开() {
+        let (session, peer, _requests) =
+            crate::chromium_fetcher::tests::checkout_session(vec![]).await;
+        let runner = runner_with(session);
+        assert_eq!(runner.warm_up(false).await.unwrap(), Warmup::Closed);
+        assert!(runner.session.lock().await.is_none(), "失效的连接要释放");
+        let _ = peer.await;
+    }
+
+    #[tokio::test]
+    async fn 有结账在等时预热导航到一半也立即让出() {
+        let (mut session, _peer, requests) =
+            crate::chromium_fetcher::tests::checkout_session(vec![
+                json!({"result": {"result": {}}}),
+                json!({"result": {"frameId": "page"}}),
+            ])
+            .await;
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        // 第一次检查时还没人等，导航发出后有结账要用这个窗口。
+        let yielding = || checks.fetch_add(1, Ordering::AcqRel) > 0;
+        assert!(matches!(
+            settle(&mut session, ACCOUNT_URL, &yielding).await,
+            Err(Settle::Yield)
+        ));
+        assert_eq!(
+            requests.lock().await.len(),
+            2,
+            "让出后不再读页面，也不再导航回购物袋"
+        );
+    }
+
+    #[tokio::test]
+    async fn 预热占着下单浏览器时到货照样接下并等它让出() {
+        let runner = CheckoutRunner::new();
+        runner.warming.store(true, Ordering::Release);
+        let warm_up = runner.session.lock().await;
+        assert!(!runner.is_busy(), "预热不算正在结账");
+        let reservation = runner.try_reserve().expect("预热占着时也要接下这次到货");
+        assert!(runner.is_busy());
+
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(runner.wanted(), "结账在等，预热的下一步应当让出");
+            drop(warm_up);
+            runner.warming.store(false, Ordering::Release);
+        };
+        let (slot, ()) = tokio::join!(runner.claim(Some(Duration::from_secs(2))), release);
+        assert!(slot.is_some(), "预热让出后结账应拿到下单浏览器");
+        assert!(
+            !runner.waiting.load(Ordering::Acquire),
+            "拿到之后不再挂着等待标记"
+        );
+        drop(slot);
+        drop(reservation);
+        assert!(!runner.is_busy());
+        assert!(!runner.wanted());
+    }
+
     fn bag_snapshot(items: Vec<serde_json::Value>) -> serde_json::Value {
         cdp_page(
             json!({"bagEmpty": items.is_empty(), "canCheckout": !items.is_empty(),
@@ -2540,18 +3235,7 @@ mod tests {
             json!({"error": {"message": "context temporarily unavailable"}}),
         ])
         .await;
-        let plan = test_plan(false);
-        let error = Flow {
-            session: &mut session,
-            plan: &plan,
-            progress: &|_| {},
-            store_number: plan.store_number.clone(),
-            store_title: plan.store_title.clone(),
-            owns_bag: false,
-        }
-        .login_context()
-        .await
-        .unwrap_err();
+        let error = login_context(&mut session).await.unwrap_err();
         assert_eq!(error.stage, Stage::SignInLoading);
         assert!(error.can_retry());
         drop(session);
@@ -2908,6 +3592,37 @@ mod tests {
         // 留一点时间让人看清停在哪一页。
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(matches!(outcome, Ok(CheckoutOutcome::ReachedReview { .. })));
+    }
+
+    /// 用临时资料打开真实下单浏览器预热一次：没登录过的资料应被账户页带到登录页，
+    /// 预热认出未登录后停回购物袋。不登录、不加购，只访问账户页和购物袋。
+    #[tokio::test]
+    #[ignore = "会打开真实浏览器窗口并访问 Apple 官网；使用临时资料，不登录"]
+    async fn 真实预热能从账户页认出未登录并停回购物袋() {
+        let profile = tempfile::tempdir().expect("无法创建临时资料目录");
+        let session = ChromiumSession::start_visible(profile.path().to_path_buf())
+            .await
+            .expect("下单浏览器启动失败");
+        let runner = runner_with(session);
+        assert_eq!(
+            runner.warm_up(false).await.expect("预热失败"),
+            Warmup::Ready {
+                opened: false,
+                signed_in: Some(false),
+            },
+            "临时资料没有登录，账户页应把它带到登录页"
+        );
+        let mut slot = runner.session.lock().await;
+        let session = slot.as_mut().expect("预热后下单浏览器应当还开着");
+        let location = read_location(session).await.expect("读不到页面位置");
+        assert_eq!(
+            (location.host.as_str(), location.path.as_str()),
+            ("www.apple.com.cn", "/shop/bag"),
+            "预热结束应停在购物袋"
+        );
+        session.close().await;
+        drop(slot);
+        runner.shutdown().await;
     }
 
     /// 需要本机装有 Chrome 或 Edge，并且会弹出一个浏览器窗口，所以默认不跑。

@@ -1,4 +1,5 @@
 import { describeBrowserFailure } from "./monitorLog.ts";
+import { formatDuration } from "./monitorSession.ts";
 import type { TargetState } from "./types.ts";
 
 export type RunTone = "paused" | "running" | "cooling" | "failed";
@@ -16,10 +17,34 @@ export interface RunStatus {
 export interface RunInput {
   running: boolean;
   cooling: boolean;
+  /** 下一次是定点查询。 */
+  alignedCheck: boolean;
+  /** 只做定点查询：不按查询间隔，正在查询时也就不提间隔。 */
+  alignedOnly: boolean;
   nextCheckAtMs: number | null;
   countdownTotalMs: number | null;
   intervalSeconds: number;
   rows: Pick<TargetState, "availability">[];
+}
+
+/** 等待时长：一分钟以内只说秒数，更长的按分、秒说，放慢探测时不必数几百秒。 */
+export function formatWait(seconds: number): string {
+  return seconds < 60 ? `${seconds} 秒` : formatDuration(seconds * 1_000);
+}
+
+/** 定点查询落在整点、半点还是其他勾选的分钟。 */
+function markWord(atMs: number): string {
+  const minute = new Date(atMs).getMinutes();
+  if (minute === 0) return "整点";
+  if (minute === 30) return "半点";
+  return "定点";
+}
+
+/** 定点查询的那一刻，例如「12:00 整点查询」「06:30 半点查询」「12:15 定点查询」。 */
+export function describeMark(atMs: number): string {
+  const at = new Date(atMs);
+  const time = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+  return `${time} ${markWord(atMs)}查询`;
 }
 
 export function describeRun(input: RunInput, nowMs: number): RunStatus {
@@ -33,12 +58,14 @@ export function describeRun(input: RunInput, nowMs: number): RunStatus {
 
   if (describeBrowserFailure(input.rows) !== null) {
     return seconds
-      ? { tone: "failed", label: "浏览器未连接", countdown: `${seconds} 秒后重试`, progress }
+      ? { tone: "failed", label: "浏览器未连接", countdown: `${formatWait(seconds)}后重试`, progress }
       : { tone: "failed", label: "浏览器未连接", countdown: "正在重新连接", progress: null };
   }
   if (!seconds) {
-    return { tone: "running", label: "正在查询", countdown: `间隔 ${input.intervalSeconds} 秒`, progress: null };
+    const pace = input.alignedOnly ? "只做定点查询" : `间隔 ${input.intervalSeconds} 秒`;
+    return { tone: "running", label: "正在查询", countdown: pace, progress: null };
   }
-  if (input.cooling) return { tone: "cooling", label: "保护冷却中", countdown: `${seconds} 秒后检查`, progress };
-  return { tone: "running", label: "监控中", countdown: `${seconds} 秒后检查`, progress };
+  if (input.cooling) return { tone: "cooling", label: "保护冷却中", countdown: `${formatWait(seconds)}后检查`, progress };
+  const mark = input.alignedCheck && input.nextCheckAtMs !== null ? markWord(input.nextCheckAtMs) : "";
+  return { tone: "running", label: "监控中", countdown: `${formatWait(seconds)}后${mark}检查`, progress };
 }

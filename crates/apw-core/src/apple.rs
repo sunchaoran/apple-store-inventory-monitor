@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -100,8 +100,8 @@ impl ApiError {
     /// 是否适合在同一次调用里快速重试。
     ///
     /// 541/403 表示当前请求特征或会话已被拒绝。原样重放只会在几秒内连续制造
-    /// 更多拦截，因此由监控层在下一轮按用户设置的间隔重试。网络瞬断、429 和
-    /// 服务端临时错误才适合在同一次调用内快速重试。
+    /// 更多拦截，因此留到下一轮再试；只有一个出口时，连续几轮被拒后查询器还会
+    /// 放慢探测。网络瞬断、429 和服务端临时错误才适合在同一次调用内快速重试。
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::RateLimited(_) | Self::Transport(_))
     }
@@ -518,10 +518,10 @@ pub trait Fetcher: Clone + Send + Sync + 'static {
         async { ScheduleHint::default() }
     }
 
-    /// 用户主动要求立即重试时，解除查询器内部的等待状态。
+    /// 用户主动要求立即重试时，清除查询器内部的冷却保护。
     ///
-    /// 默认查询器没有地区冷却，因此默认实现无需处理。带保护冷却的实现应当只
-    /// 清除等待，不伪造成功；下一轮仍按 Apple 的真实响应重新判断状态。
+    /// 默认查询器没有地区冷却，因此默认实现无需处理。带保护冷却的实现应当清除
+    /// 等待和逐级延长的档位，但不伪造成功；下一轮仍按 Apple 的真实响应重新判断状态。
     fn retry_now(&self) -> impl std::future::Future<Output = ()> + Send {
         async {}
     }
@@ -543,6 +543,22 @@ pub struct CycleStats {
     /// 本轮使用的出口线路说明，例如「Clash 节点 香港01（本轮切换 1 次）」。
     /// 跟随系统代理时为 `None`。
     pub route: Option<String>,
+    /// 仍被 Apple 拒绝的出口；所有站点都已拿到正常响应时为 `None`。
+    pub blocked: Option<BlockedRoute>,
+}
+
+/// 一个出口从第一次被 Apple 拒绝起，一直没拿到正常响应。
+///
+/// 界面据此告诉用户被拦了多久、走的是哪个出口；查询器拿到一次正常响应就清除。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedRoute {
+    /// 最近一次被拒时使用的出口，例如「系统代理 127.0.0.1:6152」「Clash 节点 香港01」。
+    pub route: String,
+    /// 第一次被拒的时刻（Unix 毫秒）。
+    pub since_ms: u64,
+    /// 期间被拒的请求次数。
+    pub rejections: u32,
 }
 
 #[derive(Debug, Clone, Default)]

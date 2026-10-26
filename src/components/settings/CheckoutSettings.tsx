@@ -6,8 +6,15 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { describeCheckoutSignIn } from "@/lib/checkoutStatus";
 import { openCheckoutBrowser, saveSettings, testCheckout } from "@/lib/store";
-import { INSTALLMENT_PERIODS, type CheckoutPayment, type CheckoutSettings as Checkout, type Target } from "@/lib/types";
+import {
+  INSTALLMENT_PERIODS,
+  type CheckoutPayment,
+  type CheckoutSettings as Checkout,
+  type CheckoutSignIn,
+  type Target,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAYMENT_LABELS: Record<CheckoutPayment, string> = {
@@ -135,14 +142,22 @@ function CheckoutLogin() {
         <Button variant="outline" size="sm" disabled={busy || !account.trim() || !password} onClick={() => void save()}>保存登录信息</Button>
         {status.saved ? <Button variant="ghost" size="sm" disabled={busy} onClick={() => void clear()}>移除</Button> : null}
       </div>
-      <p className="hint">结账要求登录时自动填写并继续。同一次流程只提交一次密码；验证码或二次验证需你处理。账号密码以明文保存在本机 checkout-login.json，仅限当前系统用户访问。请勿分享该配置文件。</p>
+      <p className="hint">结账要求登录时，以及在顶部「下单浏览器没有登录」提醒里点「登录」时，自动填写并继续。同一次流程只提交一次密码；验证码或二次验证需你处理。账号密码以明文保存在本机 checkout-login.json，仅限当前系统用户访问。请勿分享该配置文件。</p>
       {message ? <p className="text-xs" role="status">{message}</p> : null}
     </div>
   );
 }
 
 /** 「自动结账」页。只支持中国大陆直营店取货；总开关和会不会自动下单放在最上面。 */
-export function CheckoutSettings({ checkout, targets }: { checkout: Checkout; targets: Target[] }) {
+export function CheckoutSettings({
+  checkout,
+  targets,
+  signIn,
+}: {
+  checkout: Checkout;
+  targets: Target[];
+  signIn: CheckoutSignIn | null;
+}) {
   const products = monitoredProducts(targets);
   // 只监控一件时就是它；监控多件时以设置里选的为准，选的那件已不在列表里则视为没选。
   const chosen = products.length === 1
@@ -151,6 +166,7 @@ export function CheckoutSettings({ checkout, targets }: { checkout: Checkout; ta
   const targetReady = checkout.autoAddToBag ? products.length > 0 : !!chosen;
   const [suffix, setSuffix] = useState(checkout.nationalIdSuffix);
   const [busy, setBusy] = useState<"open" | "test" | null>(null);
+  const signInLine = describeCheckoutSignIn(signIn, Date.now());
 
   useEffect(() => setSuffix(checkout.nationalIdSuffix), [checkout.nationalIdSuffix]);
   // 设置里存的是旧版手填的其他名称时，也让它出现在下拉框里，不至于显示成空白。
@@ -237,6 +253,10 @@ export function CheckoutSettings({ checkout, targets }: { checkout: Checkout; ta
           {checkout.autoAddToBag
             ? "先在下单浏览器中登录并留空购物袋。试跑会加购监控列表中的第一件中国大陆商品，停在查看订单页，不会提交订单；试跑失败保留页面供检查。"
             : "首次使用先打开下单浏览器，登录 Apple 账户、加入商品并手动走一次结账。试跑用「要下单的商品」和它第一条监控项的门店，不会提交订单。"}
+        </p>
+        <p className="hint">
+          开启自动结账后，开始监控时会在后台打开下单浏览器并停在购物袋，到货时直接接着用；监控期间每 15 分钟打开一次账户页，确认 Apple 账户仍在登录后回到购物袋。你正在这个窗口里登录或浏览别的页面时不会打扰。
+          {signInLine ? <span className="font-medium text-foreground"> {signInLine}。</span> : null}
         </p>
         <CheckoutLogin />
       </section>

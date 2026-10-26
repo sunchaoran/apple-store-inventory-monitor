@@ -1,9 +1,18 @@
-import { AlertTriangle, Download, RefreshCw, X } from "lucide-react";
+import { useState } from "react";
+import { AlertTriangle, Download, LoaderCircle, LogIn, RefreshCw, X } from "lucide-react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { describeBlocked, formatMoment } from "@/lib/blockedStatus";
+import { needsCheckoutSignIn } from "@/lib/checkoutStatus";
 import type { UiState } from "@/lib/store";
-import { dismissUpdate, installUpdate, openReleasePage } from "@/lib/store";
+import {
+  dismissUpdate,
+  installUpdate,
+  openReleasePage,
+  recheckCheckoutSignIn,
+  signInCheckoutBrowser,
+} from "@/lib/store";
 import { describeBrowserFailure, describeBrowserRecovery } from "@/lib/monitorLog";
 import { describeAdvice } from "@/lib/types";
 import { describeUpdateProgress, updatePercent } from "@/lib/updateStatus";
@@ -11,16 +20,33 @@ import { describeUpdateProgress, updatePercent } from "@/lib/updateStatus";
 /** 需要用户处理的全局提示：浏览器未连接、结果不可信、发现新版本。 */
 export function StatusAlerts({
   ui,
+  clockMs,
   isRetrying,
   onRetryNow,
 }: {
   ui: UiState;
+  clockMs: number;
   isRetrying: boolean;
   onRetryNow: () => void;
 }) {
+  const [signInBusy, setSignInBusy] = useState<"open" | "check" | null>(null);
   const browserFailure = describeBrowserFailure(ui.rows);
-  const hasAlerts = browserFailure !== null || ui.trouble !== null || ui.update !== null;
+  // 被拒说明随每轮结果一起到达，不会像告警事件那样在界面卡顿时被丢掉；
+  // 只有它也照样亮出告警。
+  const blocked = ui.blocked === null ? null : describeBlocked(ui.blocked, ui, clockMs);
+  const untrusted = ui.trouble !== null || blocked !== null;
+  const signIn = needsCheckoutSignIn(ui.checkoutSignIn, ui.settings.checkout.enabled) ? ui.checkoutSignIn : null;
+  const hasAlerts = browserFailure !== null || untrusted || signIn !== null || ui.update !== null;
   if (!hasAlerts) return null;
+
+  async function runSignIn(kind: "open" | "check", action: () => Promise<void>) {
+    setSignInBusy(kind);
+    try {
+      await action();
+    } finally {
+      setSignInBusy(null);
+    }
+  }
 
   return (
     <div className="grid shrink-0 gap-2 px-4 pt-3">
@@ -52,16 +78,58 @@ export function StatusAlerts({
         </Alert>
       ) : null}
 
-      {ui.trouble !== null && browserFailure === null ? (
+      {untrusted && browserFailure === null ? (
         <Alert className="rounded-xl border-unknown/35 bg-unknown/8">
           <AlertTriangle className="text-unknown-text" aria-hidden="true" />
           <AlertTitle className="text-unknown-text">监控结果暂不可信</AlertTitle>
           <AlertDescription className="text-foreground/80">
-            <span>{ui.trouble.reason}</span>
+            {ui.trouble !== null ? <span>{ui.trouble.reason}</span> : null}
+            {blocked !== null ? (
+              <span className="text-foreground">
+                <span className="font-medium">{blocked.route}</span>，{blocked.streak}。{blocked.plan}
+              </span>
+            ) : null}
             <span>列表状态可能不代表真实库存，请先排查后再继续等待。</span>
-            {ui.trouble.advice !== null ? (
+            {ui.trouble?.advice ? (
               <span className="font-medium text-foreground">{describeAdvice(ui.trouble.advice)}</span>
             ) : null}
+          </AlertDescription>
+        </Alert>
+      ) : null}
+
+      {signIn !== null ? (
+        <Alert className="rounded-xl border-unknown/35 bg-unknown/8">
+          <LogIn className="text-unknown-text" aria-hidden="true" />
+          <AlertTitle className="text-unknown-text">下单浏览器没有登录 Apple 账户</AlertTitle>
+          <AlertDescription className="text-foreground/80">
+            <span>
+              {formatMoment(signIn.checkedAtMs, clockMs)} 确认时，账户页把下单浏览器带到了登录页。到货时结账会先要求登录：保存了登录信息时会自动登录，但要多花十几秒，遇到验证码或双重认证会停下；没保存时会停在登录页。
+            </span>
+            <span className="font-medium text-foreground">
+              建议现在就点「登录」：保存了登录信息时自动填写并提交；没保存，或 Apple 要求验证码、双重认证时，会停在登录页交给你，完成后点「重新检查」。
+            </span>
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={signInBusy !== null}
+                aria-busy={signInBusy === "open"}
+                onClick={() => void runSignIn("open", signInCheckoutBrowser)}
+              >
+                {signInBusy === "open" ? <LoaderCircle className="animate-spin motion-reduce:animate-none" aria-hidden="true" /> : <LogIn aria-hidden="true" />}
+                {signInBusy === "open" ? "正在登录…" : "登录"}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={signInBusy !== null}
+                aria-busy={signInBusy === "check"}
+                onClick={() => void runSignIn("check", recheckCheckoutSignIn)}
+              >
+                <RefreshCw className={signInBusy === "check" ? "animate-spin motion-reduce:animate-none" : undefined} aria-hidden="true" />
+                {signInBusy === "check" ? "正在检查…" : "重新检查"}
+              </Button>
+            </div>
           </AlertDescription>
         </Alert>
       ) : null}

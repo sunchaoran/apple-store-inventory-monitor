@@ -32,12 +32,12 @@ test("保护冷却明确显示等待时间且不建议用户重启", () => {
   assert.match(describeAdvice("wait_for_retry"), /无需手动重启/);
 });
 
-test("Apple 拒绝查询后明确保持用户设置的重试频率", () => {
+test("Apple 拒绝查询后说明连续被拒会自动放慢探测，不必手动重启", () => {
   const advice = describeAdvice("try_another_network");
-  assert.match(advice, /按你设置的查询间隔重试/);
-  assert.match(advice, /直到手动暂停/);
+  assert.match(advice, /连续被拒时会自动放慢探测/);
+  assert.match(advice, /不必手动重启/);
   assert.match(advice, /不会自动弹出页面/);
-  assert.doesNotMatch(advice, /延长重试间隔/);
+  assert.match(advice, /调大查询间隔/);
 });
 
 test("浏览器页面请求失败会保留真实原因和原始重试频率", () => {

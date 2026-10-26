@@ -232,6 +232,10 @@ export interface Settings {
   targets: Target[];
   deliveryRegion: DeliveryRegion | null;
   intervalSeconds: number;
+  /** 定点查询：每小时的哪几分钟立即查一轮，例如 [0, 15, 30, 45]；空数组表示关闭。与 Rust 侧 `AlignedChecks` 对应。 */
+  alignedChecks: number[];
+  /** 只做定点查询：不按查询间隔，只在 `alignedChecks` 的时刻查询；一个时刻都没勾时不生效。 */
+  alignedOnly: boolean;
   /** 按商品零件号覆盖默认 Bark；同一型号在不同门店共用。 */
   productBarkUrls: Record<string, string>;
   barkUrl: string;
@@ -273,6 +277,23 @@ export interface Trouble {
   advice: TroubleAdvice | null;
 }
 
+/** 下单浏览器里 Apple 账户的登录检查结果。与 Rust 侧 `CheckoutSignIn` 对应。 */
+export interface CheckoutSignIn {
+  signedIn: boolean;
+  /** 检查的时刻（Unix 毫秒）。 */
+  checkedAtMs: number;
+}
+
+/** 一个出口从第一次被 Apple 拒绝起，一直没拿到正常响应。与 Rust 侧 `apple::BlockedRoute` 对应。 */
+export interface BlockedRoute {
+  /** 最近一次被拒时使用的出口，例如「系统代理 127.0.0.1:6152」「Clash 节点 香港01」。 */
+  route: string;
+  /** 第一次被拒的时刻（Unix 毫秒）。 */
+  sinceMs: number;
+  /** 期间被拒的请求次数。 */
+  rejections: number;
+}
+
 export type WatcherEvent =
   | { type: "stateChanged"; state: TargetState }
   | { type: "inStock"; state: TargetState }
@@ -285,8 +306,12 @@ export type WatcherEvent =
       reusedResponseCount: number;
       nextCheckInSecs: number;
       cooling: boolean;
+      /** 下一次是整点或半点的定点查询。 */
+      alignedCheck: boolean;
       /** 本轮使用的出口线路；跟随系统代理时省略。 */
       route?: string;
+      /** 仍被 Apple 拒绝的出口和起始时间；没有出口被拒时省略。 */
+      blocked?: BlockedRoute;
       healthy: boolean;
       snapshot: TargetState[];
     }
@@ -298,9 +323,9 @@ export function describeAdvice(advice: TroubleAdvice): string {
   switch (advice) {
     case "try_another_network":
       return (
-        "Apple 拒绝了这次查询。程序会保留专属后台浏览器会话，且不会自动弹出页面；" +
-        "随后会复用同一会话，按你设置的查询间隔重试，" +
-        "直到手动暂停，不会延长等待；若仍持续失败，再对照官网或切换网络检查。"
+        "Apple 拒绝了这次查询，常见原因是当前出口短时间内请求太多。程序会保留专属后台浏览器会话，" +
+        "不会自动弹出页面；连续被拒时会自动放慢探测，不必手动重启。" +
+        "如果一直被拒，可以调大查询间隔，或换一个出口（例如改用 Clash 节点轮换）。"
       );
     case "wait_for_retry":
       return "程序已暂停当前地区的真实请求，冷却结束后会自动进行一次恢复探测，无需手动重启。";
