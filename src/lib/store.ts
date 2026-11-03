@@ -797,10 +797,10 @@ export function dismissUpdate(): void {
   update({ update: null, updateError: null });
 }
 
-/** 自动更新不可用时，打开本项目的完整安装包下载页。 */
+/** 自动更新不可用时，打开本项目的完整安装包下载页。和应用内更新一样指向拾果自己的仓库，不会把人带去装上游的果到雷达。 */
 export async function openReleasePage(): Promise<void> {
   try {
-    await openUrl("https://github.com/suversal/apple-store-inventory-monitor/releases/latest");
+    await openUrl("https://github.com/sunchaoran/apple-store-inventory-monitor/releases/latest");
   } catch (err) {
     update({ updateError: `无法打开下载页：${String(err)}` });
   }
@@ -814,10 +814,10 @@ async function openCommunityPage(url: string, label: string): Promise<void> {
   }
 }
 
-/** 打开开源仓库主页，可从 Releases 下载最新版。 */
+/** 打开拾果的开源仓库主页，可从 Releases 下载最新版。上游项目在仓库说明里注明。 */
 export function openProjectPage(): Promise<void> {
   return openCommunityPage(
-    "https://github.com/suversal/apple-store-inventory-monitor",
+    "https://github.com/sunchaoran/apple-store-inventory-monitor",
     "GitHub 项目页",
   );
 }
